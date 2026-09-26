@@ -56,7 +56,7 @@ def build_html() -> Path:
         + app_js
         + "\n</script>\n</body>\n</html>\n"
     )
-    output = ROOT / "dl_pro_dashboard.html"
+    output = ROOT / "index.html"
     output.write_text(html, encoding="utf-8")
     return output
 
