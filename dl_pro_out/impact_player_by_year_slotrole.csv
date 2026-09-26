@@ -1,0 +1,5 @@
+year,slot_role,n,mean_slot_impact,mean_baseline_worst,mean_baseline_mean
+2023,Batting slot,48,2.413,-13.396,-2.947
+2023,Bowling slot,86,2.457,-8.983,4.144
+2024,Batting slot,53,0.231,-12.055,-2.194
+2024,Bowling slot,79,3.558,-10.741,2.713

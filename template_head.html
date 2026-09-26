@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DPL Project</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"
+  onerror="this.onerror=null;this.src='https://unpkg.com/chart.js@4.4.4/dist/chart.umd.min.js'"></script>
+<style>
+:root{
+  --bg:#0f1115; --card:#171a21; --card2:#1f232d; --text:#e8eaf0; --muted:#9aa2b1;
+  --accent:#5b8cff; --pos:#3fb27f; --neg:#e2564f; --border:#2a2f3a;
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){ --bg:#f5f6f9; --card:#fff; --card2:#f0f1f5; --text:#1a1d24; --muted:#5b6270; --border:#dfe2ea; }
+}
+*{box-sizing:border-box;}
+html{scroll-padding-top:env(safe-area-inset-top,0px);}
+body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+  padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);}
+header{padding:16px 20px 8px;position:sticky;top:0;background:var(--bg);z-index:5;border-bottom:1px solid var(--border)}
+h1{font-size:1.25rem;margin:0 0 10px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tab{padding:8px 14px;border-radius:8px;cursor:pointer;background:var(--card2);color:var(--muted);font-size:.9rem;font-weight:600}
+.tab.active{background:var(--accent);color:#fff}
+main{padding:16px 20px 40px;max-width:1100px;margin:0 auto}
+.panel{display:none}
+.panel.active{display:block}
+.row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+select,input{background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:.9rem}
+.cards{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 16px;min-width:120px}
+.card .v{font-size:1.4rem;font-weight:700}
+.card .l{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+.pos{color:var(--pos)} .neg{color:var(--neg)}
+.section{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-bottom:16px;overflow-x:auto}
+.section h3{margin:0 0 10px;font-size:1rem}
+.chart-wrap{position:relative;height:280px}
+.chart-wrap.tall{height:340px}
+table{border-collapse:collapse;width:100%;font-size:.82rem}
+th,td{padding:6px 8px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}
+th{color:var(--muted);font-weight:600;font-size:.72rem;text-transform:uppercase}
+.logo{height:34px;width:34px;object-fit:contain;vertical-align:middle;border-radius:6px;background:#fff;padding:3px}
+.namebar{display:flex;align-items:center;gap:10px}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--card2);font-size:.72rem;color:var(--muted)}
+.muted{color:var(--muted);font-size:.82rem}
+.grid-heat td{text-align:center;font-size:.75rem;padding:8px 4px}
+.note{font-size:.78rem;color:var(--muted);margin-top:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🏏 Data Premier League 2026 Impact Dashboard - by <a href="https://archithsharma.github.io">Archith Sharma</a> <span class="pill">IPL 2023–24</span></h1>
+  <div class="tabs">
+    <div class="tab active" data-panel="players">Player Analysis</div>
+    <div class="tab" data-panel="teams">Team Analysis</div>
+    <div class="tab" data-panel="impact">Impact Player</div>
+    <div class="tab" data-panel="auction">Auction Value</div>
+  </div>
+</header>
+<main>
+
+<section id="players" class="panel active">
+  <div class="row">
+    <input list="playerList" id="playerSearch" placeholder="Search a player…" style="min-width:240px">
+    <datalist id="playerList"></datalist>
+    <select id="roleToggle" style="display:none"></select>
+  </div>
+  <div id="playerContent"></div>
+</section>
+
+<section id="teams" class="panel">
+  <div class="row">
+    <select id="teamSelect"></select>
+  </div>
+  <div id="teamContent"></div>
+</section>
+
+<section id="impact" class="panel">
+  <div class="row">
+    <select id="ipYear"><option value="all">All years</option></select>
+    <select id="ipTeam"><option value="all">All teams</option></select>
+    <select id="ipSort">
+      <option value="date">Sort: date</option>
+      <option value="vs_mean">Sort: value vs mean (best)</option>
+      <option value="vs_mean_worst">Sort: value vs mean (worst)</option>
+    </select>
+  </div>
+  <div class="section"><h3>Impact-Player substitutions vs. mean same-role teammate</h3>
+    <div class="chart-wrap tall"><canvas id="ipChart"></canvas></div>
+    <p class="note">Each bar = combined Impact of the player who left + the Impact Player who replaced them, for that match, compared to the <b>mean</b> other teammate in the same role (bowling or batting slot). Positive = the substitution slot outperformed a typical teammate.</p>
+  </div>
+  <div class="section"><h3>Impact vs mean distribution by year</h3><table id="ipDistTable"></table></div>
+  <div class="section"><h3>Impact vs mean distribution by innings and year</h3>
+    <div class="chart-wrap tall"><canvas id="ipDistChart"></canvas></div>
+    <p class="note">Each distribution shows both batting and bowling slot benefit relative to the corresponding mean teammate. Comparing innings 1 with innings 2 across years shows whether the Impact Player rule's advantage shifted toward the team batting second.</p>
+  </div>
+  <div class="section"><h3>Substitution log</h3><div style="max-height:420px;overflow:auto"><table id="ipTable"></table></div></div>
+</section>
+
+<section id="auction" class="panel">
+  <div class="row">
+    <select id="aucYear"><option value="all">All years</option></select>
+  </div>
+  <div class="section"><h3>Impact per crore spent</h3>
+    <div class="chart-wrap tall"><canvas id="aucChart"></canvas></div>
+    <p class="note">Y = season Impact per ball relative to the batting or bowling role mean. Positive values are above the role mean.</p>
+  </div>
+  <div class="section"><h3>Auction comparison by mean-relative Impact</h3><div style="max-height:520px;overflow:auto"><table id="aucTable"></table></div></div>
+</section>
+
+</main>
+<script>

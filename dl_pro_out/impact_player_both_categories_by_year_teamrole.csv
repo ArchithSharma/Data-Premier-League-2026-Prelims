@@ -1,0 +1,5 @@
+year,team_role,n,mean_batting_slot_impact_vs_mean,mean_bowling_slot_impact_vs_mean,mean_substitution_effect
+2023,Batted 1st,62,1.414,-1.063,0.351
+2023,Batted 2nd,72,-2.471,-1.574,-4.049
+2024,Batted 1st,69,-0.356,-1.209,-1.566
+2024,Batted 2nd,63,-2.359,2.467,0.108
