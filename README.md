@@ -47,7 +47,7 @@ After editing `template_head.html` or `template_app.js`, or when the existing CS
 python generate_dashboard.py
 ```
 
-The wrapper validates the final embedded script with Node.js. Open `dl_pro_dashboard.html` from VS Code or your browser.
+The wrapper validates the final embedded script with Node.js. Open `index.html` from VS Code or your browser.
 
 ## Current Analysis Defaults
 

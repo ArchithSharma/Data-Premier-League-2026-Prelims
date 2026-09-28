@@ -418,6 +418,13 @@ def summarize_by_player_season(d, player_col, raa_col, waa_col, impact_col=None,
     out["RAA_per_ball"] = out["RAA"] / out["balls"]
     if impact_col is not None:
         out["impact_per_ball"] = out["Impact"] / out["balls"]
+        # Percentile rank *within that year's qualified pool* (batters among
+        # batters-that-year, bowlers among bowlers-that-year) -- NOT the
+        # career-pool percentile from summarize_by_player. A player's 2023
+        # and 2024 percentiles are each relative to who else cleared
+        # min_balls that specific year, so they aren't directly comparable
+        # to the single career Impact_pctile in the player-level table.
+        out["Impact_pctile"] = out.groupby("year")["Impact"].rank(pct=True) * 100
     return out.sort_values([player_col, "year"])
 
 
@@ -1866,31 +1873,37 @@ def main(csv_path, outdir="dl_pro_out", fix_n0=1.04, impact_clip=20.0,
           f"bowling={role_means['bowling']:.3f}")
 
     # Save team-by-year breakdowns used by the dashboard, including the
-    # role-relative values shown in its team charts.
+    # role-relative values shown in its team charts. impact_se lets the dashboard keep
+    # every category (no more dropping low-sample ones) while still drawing an honest
+    # error bar for the noisier, low-sample cells.
     team_shot_rows, team_zone_rows, team_line_rows, team_speed_rows = [], [], [], []
     for team in sorted(raa_waa_df["team_bat"].dropna().unique()):
         bat_team = raa_waa_df[raa_waa_df["team_bat"] == team]
         for (year, shot), g in bat_team.dropna(subset=["shot"]).groupby(["year", "shot"]):
             value = g["impact"].mean()
+            se = g["impact"].std() / np.sqrt(len(g)) if len(g) > 1 else np.nan
             team_shot_rows.append({"team": team, "year": int(year), "shot": shot,
-                                   "balls": len(g), "impact": value,
+                                   "balls": len(g), "impact": value, "impact_se": se,
                                    "impact_vs_mean": value - role_means["batting"]})
         for (year, zone), g in wagon_df[wagon_df["team_bat"] == team].groupby(["year", "wagonzone_bp"]):
             value = g["impact"].mean()
+            se = g["impact"].std() / np.sqrt(len(g)) if len(g) > 1 else np.nan
             team_zone_rows.append({"team": team, "year": int(year), "zone": int(zone),
-                                   "balls": len(g), "impact": value,
+                                   "balls": len(g), "impact": value, "impact_se": se,
                                    "impact_vs_mean": value - role_means["batting"]})
     for team in sorted(raa_waa_df["team_bowl"].dropna().unique()):
         bowl_team = raa_waa_df[raa_waa_df["team_bowl"] == team]
         for (year, length, line), g in bowl_team.dropna(subset=["length", "line"]).groupby(["year", "length", "line"]):
             value = g["bowl_impact"].mean()
+            se = g["bowl_impact"].std() / np.sqrt(len(g)) if len(g) > 1 else np.nan
             team_line_rows.append({"team": team, "year": int(year), "length": length, "line": line,
-                                   "balls": len(g), "impact": value,
+                                   "balls": len(g), "impact": value, "impact_se": se,
                                    "impact_vs_mean": value - role_means["bowling"]})
         for (year, speed), g in bowl_team.dropna(subset=["bowl_speed_category"]).groupby(["year", "bowl_speed_category"]):
             value = g["bowl_impact"].mean()
+            se = g["bowl_impact"].std() / np.sqrt(len(g)) if len(g) > 1 else np.nan
             team_speed_rows.append({"team": team, "year": int(year), "speed": int(speed),
-                                    "balls": len(g), "impact": value,
+                                    "balls": len(g), "impact": value, "impact_se": se,
                                     "impact_vs_mean": value - role_means["bowling"]})
     pd.DataFrame(team_shot_rows).to_csv(os.path.join(outdir, "team_shot_type_by_year.csv"), index=False)
     pd.DataFrame(team_zone_rows).to_csv(os.path.join(outdir, "team_wagon_zone_by_year.csv"), index=False)
@@ -2497,7 +2510,14 @@ CSV_CONFIG = {
     "impact_clip": 20.0,
     "min_balls_bat": 100,
     "min_balls_bowl": 100,
-    "min_balls_season": 100,
+    # A single SEASON has far fewer deliveries than a career, so this must be well below
+    # min_balls_bat/bowl -- 30 is summarize_by_player_season's own documented default.
+    # Leaving this at 100 (a full-career-sized threshold) was silently dropping entire
+    # player-seasons from percentile_by_year and the season tables: at 100, 40/92
+    # career-qualified batters and 39/93 career-qualified bowlers were missing at least
+    # one season, including several missing BOTH seasons individually despite qualifying
+    # career-wide. At 30, that drops to 0 both-seasons-missing cases.
+    "min_balls_season": 30,
     "min_balls_team": 200,
     "min_matches_venue": 4,
     "top_n_plot": 20,

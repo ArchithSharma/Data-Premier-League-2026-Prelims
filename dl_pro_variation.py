@@ -114,6 +114,28 @@ def variation_by_kind(d):
             .reset_index())
 
 
+def variation_impact_correlation(d, min_balls=30):
+    """
+    Pearson correlation between per-delivery variation distance and bowl_impact, by year
+    (and by bowl_kind x year, since pace and spin sit on very different variation/impact
+    scales and pooling them can hide or manufacture a correlation that isn't really there).
+    Positive r = more variation from ball to ball went with better bowling outcomes that
+    year; negative r = more predictable deliveries actually paid off better.
+    """
+    d = _prep(d).dropna(subset=["bowl_impact"])
+    rows = []
+    for yr, sub in d.groupby("year"):
+        rows.append({"year": int(yr), "bowl_kind": "all", "n_balls": len(sub),
+                     "corr_distance_impact": sub["delivery_distance"].corr(sub["bowl_impact"])})
+        if "bowl_kind" in sub.columns:
+            for kind, sk in sub.groupby("bowl_kind"):
+                if len(sk) < min_balls:
+                    continue
+                rows.append({"year": int(yr), "bowl_kind": kind, "n_balls": len(sk),
+                             "corr_distance_impact": sk["delivery_distance"].corr(sk["bowl_impact"])})
+    return pd.DataFrame(rows)
+
+
 def variation_slope_shift(d, year_a=None, year_b=None):
     """
     bowl_impact ~ z(|dlength|) + z(|dline|) + z(|dspeed|) + is_year_b + interactions.
