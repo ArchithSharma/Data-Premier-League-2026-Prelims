@@ -133,7 +133,8 @@ const errorBarPlugin = {
         const clippedTop = yTop > Math.min(rawTop, rawBot) + 0.5;
         const clippedBot = yBot < Math.max(rawTop, rawBot) - 0.5;
         ctx.save();
-        ctx.strokeStyle = ds.borderColor || '#f2b84b';
+        // whiskers on bars use the page text colour so they read on top of green/red/grey bars
+        ctx.strokeStyle = meta.type==='bar' ? (getComputedStyle(document.documentElement).getPropertyValue('--text').trim() || '#e8eaf0') : (ds.borderColor || '#f2b84b');
         ctx.lineWidth = 1.5;
         ctx.beginPath();
         ctx.moveTo(x, yTop); ctx.lineTo(x, yBot);
@@ -159,6 +160,65 @@ const errorBarPlugin = {
   }
 };
 if(typeof Chart !== 'undefined'){ try{ Chart.register(errorBarPlugin); }catch(e){} }
+
+// Draws the actual numbers on the chart (not just in the hover tooltip): any dataset carrying a
+// `valueLabels` array (one string per point, e.g. '2.4→2.6') gets that text drawn at each point.
+// Bars put it just beyond the bar's end (above positive, below negative); line points put it above
+// the marker, flipping below when there's no room. Each label sits on a small pill in the card
+// colour so it stays readable over gridlines / neighbouring marks, and colours follow the page theme.
+const valueLabelPlugin = {
+  id: 'valueLabelPlugin',
+  afterDatasetsDraw(chart){
+    const ctx = chart.ctx, area = chart.chartArea;
+    if(!area) return;
+    const css = getComputedStyle(document.documentElement);
+    const cardBg = (css.getPropertyValue('--card') || '#171a21').trim();
+    const textCol = (css.getPropertyValue('--text') || '#e8eaf0').trim();
+    const placed = [];   // rects already drawn this pass, so labels from the bar and line datasets don't sit on top of each other
+    chart.data.datasets.forEach((ds, di)=>{
+      if(!ds.valueLabels) return;
+      const meta = chart.getDatasetMeta(di);
+      if(!meta || meta.hidden) return;
+      const isBar = meta.type === 'bar';
+      ctx.save();
+      ctx.font = '600 9.5px -apple-system,Segoe UI,Roboto,Arial,sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      meta.data.forEach((el, i)=>{
+        const txt = ds.valueLabels[i], v = ds.data[i];
+        if(!txt || v==null || !Number.isFinite(v) || !Number.isFinite(el.x) || !Number.isFinite(el.y)) return;
+        const w = ctx.measureText(txt).width + 6, h = 12;
+        const zeroY = isBar ? chart.scales[meta.yAxisID].getPixelForValue(0) : null;
+        let up = isBar ? (el.y <= zeroY) : true;     // bar: label beyond the bar end; line: above the marker
+        // a bar with an error whisker gets its label beyond the whisker's far end, not on top of it
+        let anchor = el.y;
+        const err = ds.errorBars ? ds.errorBars[i] : null;
+        if(isBar && err!=null && Number.isFinite(err)){
+          const sc = chart.scales[meta.yAxisID];
+          const tip = sc.getPixelForValue(v + (up ? err : -err));
+          anchor = up ? Math.max(area.top, tip) : Math.min(area.bottom, tip);
+        }
+        let y = up ? anchor - 4 - h/2 : anchor + 4 + h/2;
+        if(y - h/2 < area.top - 14){ y = anchor + 4 + h/2; }       // no headroom above -> put it below
+        if(y + h/2 > area.bottom + 14){ y = anchor - 4 - h/2; }
+        const hit = yy => placed.some(r=> Math.abs(r.x - el.x) < (r.w + w)/2 && Math.abs(r.y - yy) < h);
+        const step = up ? -(h+1) : (h+1);
+        for(let n=0; n<4 && hit(y); n++) y += step;              // nudge away from an overlapping label
+        y = Math.max(area.top - 14 + h/2, Math.min(area.bottom + 14 - h/2, y));
+        placed.push({x:el.x, y, w});
+        ctx.fillStyle = cardBg; ctx.globalAlpha = 0.82;
+        ctx.fillRect(el.x - w/2, y - h/2, w, h);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = isBar ? textCol : (ds.borderColor || '#f2b84b');
+        ctx.fillText(txt, el.x, y);
+      });
+      ctx.restore();
+    });
+  }
+};
+if(typeof Chart !== 'undefined'){ try{ Chart.register(valueLabelPlugin); }catch(e){} }
+
+// Which Impact-Player metric the distribution (ridge + table) uses. Declared up here so it exists before the first render.
+const ipMetricVal = e=> document.getElementById('ipMetric').value==='oe' ? e.oe : e.substitution_effect;
 
 // ---------- tabs ----------
 document.querySelectorAll('.tab').forEach(t=>{
@@ -277,11 +337,17 @@ function renderRole(role, d, playerName){
 // season is shown plain.
 function yearBlock(id, obj, title, key, isZone){
   const yrs = years(obj);
-  const sub = yrs.length >= 2 ? `Change, ${yrs[0]} → ${yrs[yrs.length-1]}` : (yrs[0] || 'No data');
+  const sub = yrs.length >= 2
+    ? `Change, ${yrs[0]} → ${yrs[yrs.length-1]} — in each pair the grey bar is ${yrs[0]} and the coloured bar is ${yrs[yrs.length-1]} (green = went up, red = went down)`
+    : (yrs[0] || 'No data');
   return `<div class="section"><h3>${title}</h3>
     <div class="row muted">${sub}</div>
+    <div class="muted" style="margin:6px 0 2px"><b>How often</b> — share of deliveries (%)</div>
     <div class="chart-wrap"><canvas id="${id}-chart"></canvas></div>
-    <div id="${id}-idx" class="muted" style="margin-top:6px"></div></div>`;
+    <div class="muted" style="margin:10px 0 2px"><b>How well</b> — Impact vs role mean / ball (± standard error)</div>
+    <div class="chart-wrap"><canvas id="${id}-chart2"></canvas></div>
+    <div id="${id}-idx" class="muted" style="margin-top:6px"></div>
+    <div id="${id}-vals"></div></div>`;
 }
 function catLabel(r, key){ return key==='zone' ? 'Zone '+r.zone : r[key]; }
 function relImpact(r, mean){ return r.impact_vs_mean!=null ? r.impact_vs_mean : r.impact-mean; }
@@ -305,58 +371,88 @@ function mergeSeasons(rowsA, rowsB, key, mean){
 // absolute percentage-point changes. 0 = identical mix both seasons; 100 = completely
 // different mix (no category shared at all). This is the "change index".
 function changeIndex(merged){ return merged.reduce((s,r)=>s+Math.abs(r.deltaPct),0)/2; }
+// Signed number for deltas ('+0.20' / '-0.20'); '–' when missing.
+function sgn2(v){ return v==null||!Number.isFinite(v) ? '–' : (v>=0?'+':'')+(Math.round(v*100)/100).toFixed(2); }
+// 'A → B' text for a first-season / last-season value pair, so a delta is never shown without the values behind it.
+function fromTo(a, b, f){ f = f||fmt; return `${a==null?'–':f(a)} → ${b==null?'–':f(b)}`; }
+// Table of the raw per-season values behind the change chart (share of deliveries and Impact
+// vs role mean / ball for both seasons, plus the deltas), tucked in a <details> so the
+// chart stays the focus but the numbers are one click away.
+function yearValuesTable(merged, yrA, yrB, keyLabel){
+  const rows = merged.map(r=>`<tr><td style="text-align:left">${r.label}</td>
+    <td>${r.pctA.toFixed(1)}%</td><td>${r.pctB.toFixed(1)}%</td><td class="${r.deltaPct>=0?'pos':'neg'}">${r.deltaPct>=0?'+':''}${r.deltaPct.toFixed(1)}pp</td>
+    <td>${r.implA!=null?fmt(r.implA):'–'}</td><td>${r.implB!=null?fmt(r.implB):'–'}</td>
+    <td class="${r.deltaImpl==null?'':(r.deltaImpl>=0?'pos':'neg')}">${sgn2(r.deltaImpl)}${r.deltaSe!=null?' <span class="muted">±'+fmt(r.deltaSe)+'</span>':''}</td></tr>`).join('');
+  return `<details style="margin-top:6px"><summary class="muted" style="cursor:pointer">Show the underlying values (${yrA} and ${yrB})</summary>
+    <div style="overflow-x:auto"><table class="grid-heat" style="margin-top:6px"><tr><th>${keyLabel}</th><th>% ${yrA}</th><th>% ${yrB}</th><th>Δ pp</th>
+    <th>Impact ${yrA}</th><th>Impact ${yrB}</th><th>Δ Impact</th></tr>${rows}</table></div></details>`;
+}
+// Two separate plots (share of deliveries on top, Impact underneath) with grouped bars, one bar per
+// season, and exactly ONE number printed on each bar. That keeps every plot to a single quantity
+// -- no more "2.4→2.6" pairs stacked on a bar-plus-line combo -- while the change itself is carried
+// by colour (the last-season bar is green if the value went up, red if it went down) and by the
+// tooltip / values table, which spell out both values and the delta.
+function groupedChart(canvasId, labels, datasets, yTitle, tipFn){
+  safeChart(canvasId, canvasId, {
+    type:'bar', data:{ labels, datasets },
+    options:{ responsive:true, maintainAspectRatio:false, layout:{ padding:{ top:18, bottom:10 } },
+      plugins:{ legend:{ display:false }, tooltip:{ callbacks:{ label: tipFn } } },
+      scales:{ x:{ ticks:{ autoSkip:false, maxRotation:40, minRotation:20 } },
+               y:{ title:{ display:true, text:yTitle } } } }
+  });
+}
+const SEASON_A_COL = 'rgba(138,147,166,.75)';
 function drawYearChart(id, rowsA, rowsB, key, keyLabel, mean, yrA, yrB){
-  killChart(id+'-chart');
+  killChart(id+'-chart'); killChart(id+'-chart2');
   const idxBox = document.getElementById(id+'-idx');
+  const vb = document.getElementById(id+'-vals');
+  const pct1 = v => v==null ? null : +v.toFixed(1);
   if(yrB===undefined){
-    // only one season available -- nothing to diff, show it plain. Every category is
-    // kept (no top-N cutoff); low-sample ones simply carry a wider error bar.
+    // only one season available -- nothing to diff, show it plain. Every category is kept (no
+    // top-N cutoff); low-sample ones simply carry a wider error bar.
     let rows = (rowsA||[]).slice().sort((a,b)=> (key==='zone') ? a.zone-b.zone : b.pct-a.pct);
     const labels = rows.map(r=>catLabel(r,key));
-    safeChart(id+'-chart', id+'-chart', {
-      data:{ labels, datasets:[
-        { type:'bar', label:'% of deliveries', data: rows.map(r=>r.pct), backgroundColor:'rgba(91,140,255,.55)', yAxisID:'y' },
-        { type:'line', label:'Impact vs role mean / ball', data: rows.map(r=>relImpact(r,mean)), borderColor:'#f2b84b', backgroundColor:'#f2b84b', yAxisID:'y1', tension:.2, errorBars: rows.map(r=>r.se) },
-      ]},
-      options:{ responsive:true, maintainAspectRatio:false,
-        plugins:{ tooltip:{ callbacks:{ label:(ctx)=>{ const r = rows[ctx.dataIndex];
-          return ctx.dataset.yAxisID==='y'
-            ? `${catLabel(r,key)}: ${fmt(r.pct)}% of deliveries (${r.balls} balls)`
-            : `${catLabel(r,key)}: Impact vs mean ${fmt(relImpact(r,mean))}` + (r.se!=null ? ` ± ${fmt(r.se)}` : ''); } } } },
-        scales:{ x:{ ticks:{ autoSkip:false, maxRotation:40, minRotation:20 } },
-                 y:{ position:'left', title:{display:true,text:'% of deliveries'} },
-                 y1:{ position:'right', title:{display:true,text:'Impact vs mean / ball'}, grid:{drawOnChartArea:false} } } }
-    });
+    const impl = rows.map(r=>relImpact(r,mean));
+    groupedChart(id+'-chart', labels,
+      [{ label:'% of deliveries', data: rows.map(r=>r.pct), backgroundColor:'rgba(91,140,255,.65)', valueLabels: rows.map(r=>r.pct.toFixed(1)) }],
+      '% of deliveries', ctx=>{ const r = rows[ctx.dataIndex]; return `${catLabel(r,key)}: ${fmt(r.pct)}% of deliveries (${r.balls} balls)`; });
+    groupedChart(id+'-chart2', labels,
+      [{ label:'Impact vs role mean / ball', data: impl, backgroundColor: impl.map(v=>colorFor(v)), errorBars: rows.map(r=>r.se), valueLabels: impl.map(v=>v.toFixed(2)) }],
+      'Impact vs mean / ball', ctx=>{ const r = rows[ctx.dataIndex]; return `${catLabel(r,key)}: Impact vs mean ${fmt(impl[ctx.dataIndex])}` + (r.se!=null ? ` ± ${fmt(r.se)}` : ''); });
     if(idxBox) idxBox.textContent = '';
+    if(vb) vb.innerHTML = '';
     return;
   }
   let merged = mergeSeasons(rowsA, rowsB, key, mean);
   const idx = changeIndex(merged);
-  // Every category from either season is kept (no top-14 cutoff) -- sorted so the
-  // biggest movers are still easy to spot at a glance, but nothing is hidden.
+  // Every category from either season is kept (no top-14 cutoff) -- sorted so the biggest movers
+  // are still easy to spot at a glance, but nothing is hidden. Both plots share this order.
   merged = merged.slice().sort((a,b)=>Math.abs(b.deltaPct)-Math.abs(a.deltaPct));
   const labels = merged.map(r=>r.label);
-  safeChart(id+'-chart', id+'-chart', {
-    data:{ labels, datasets:[
-      { type:'bar', label:`Δ % of deliveries (${yrA}→${yrB})`, data: merged.map(r=>r.deltaPct), backgroundColor: merged.map(r=>colorFor(r.deltaPct)), yAxisID:'y' },
-      { type:'line', label:'Δ Impact vs role mean / ball', data: merged.map(r=>r.deltaImpl), borderColor:'#f2b84b', backgroundColor:'#f2b84b', yAxisID:'y1', tension:.2, errorBars: merged.map(r=>r.deltaSe) },
-    ]},
-    options:{ responsive:true, maintainAspectRatio:false,
-      plugins:{ tooltip:{ callbacks:{ label:(ctx)=>{ const r = merged[ctx.dataIndex];
-        return ctx.dataset.yAxisID==='y'
-          ? `${r.label}: ${yrA} ${fmt(r.pctA)}% → ${yrB} ${fmt(r.pctB)}% (Δ ${fmt(r.deltaPct)}pp)`
-          : `${r.label}: Δ Impact vs mean ${fmt(r.deltaImpl)}` + (r.deltaSe!=null ? ` ± ${fmt(r.deltaSe)}` : ''); } } } },
-      scales:{ x:{ ticks:{ autoSkip:false, maxRotation:40, minRotation:20 } },
-               y:{ position:'left', title:{display:true,text:'Δ % of deliveries (pp)'} },
-               y1:{ position:'right', title:{display:true,text:'Δ Impact vs role mean / ball'}, grid:{drawOnChartArea:false} } } }
-  });
-  if(idxBox) idxBox.innerHTML = `<b>Change index: ${idx.toFixed(1)}</b> — ${idx.toFixed(1)}% of ${keyLabel.toLowerCase()} share moved to a different category from ${yrA} to ${yrB} (0 = no change in mix, 100 = totally different mix). Error bars on the Δ Impact line show combined standard error across both seasons.`;
+  // A category that one season never used has no bar (rather than a bar of 0) in that season.
+  const pA = merged.map(r=> r.pctA>0 ? r.pctA : null), pB = merged.map(r=> r.pctB>0 ? r.pctB : null);
+  groupedChart(id+'-chart', labels, [
+    { label:`${yrA}`, data:pA, backgroundColor:SEASON_A_COL, valueLabels:pA.map(v=>v==null?null:v.toFixed(1)) },
+    { label:`${yrB}`, data:pB, backgroundColor:merged.map(r=>colorFor(r.deltaPct)), valueLabels:pB.map(v=>v==null?null:v.toFixed(1)) },
+  ], '% of deliveries', ctx=>{ const r = merged[ctx.dataIndex];
+      return ctx.datasetIndex===0 ? `${r.label} ${yrA}: ${fmt(r.pctA)}% of deliveries`
+                                  : `${r.label} ${yrB}: ${fmt(r.pctB)}% of deliveries (Δ ${r.deltaPct>=0?'+':''}${fmt(r.deltaPct)}pp vs ${yrA})`; });
+  groupedChart(id+'-chart2', labels, [
+    { label:`${yrA}`, data:merged.map(r=>r.implA), backgroundColor:SEASON_A_COL, errorBars:merged.map(r=>r.seA), valueLabels:merged.map(r=>r.implA==null?null:r.implA.toFixed(2)) },
+    { label:`${yrB}`, data:merged.map(r=>r.implB), backgroundColor:merged.map(r=> r.deltaImpl==null ? 'rgba(91,140,255,.65)' : colorFor(r.deltaImpl)), errorBars:merged.map(r=>r.seB), valueLabels:merged.map(r=>r.implB==null?null:r.implB.toFixed(2)) },
+  ], 'Impact vs mean / ball', ctx=>{ const r = merged[ctx.dataIndex];
+      const own = ctx.datasetIndex===0 ? [r.implA, r.seA, yrA] : [r.implB, r.seB, yrB];
+      let t = `${r.label} ${own[2]}: Impact vs mean ${fmt(own[0])}` + (own[1]!=null ? ` ± ${fmt(own[1])}` : '');
+      if(ctx.datasetIndex===1 && r.deltaImpl!=null) t += ` (Δ ${sgn2(r.deltaImpl)}` + (r.deltaSe!=null ? ` ± ${fmt(r.deltaSe)}` : '') + ` vs ${yrA})`;
+      return t; });
+  if(vb) vb.innerHTML = yearValuesTable(merged, yrA, yrB, keyLabel);
+  if(idxBox) idxBox.innerHTML = `<b>Change index: ${idx.toFixed(1)}</b> — ${idx.toFixed(1)}% of ${keyLabel.toLowerCase()} share moved to a different category from ${yrA} to ${yrB} (0 = no change in mix, 100 = totally different mix). Hover a bar for both seasons' values and the change; the table below lists every number. Whiskers on the Impact bars are each season's standard error, so low-sample categories read as noisy.`;
 }
 function setupYearBlock(id, obj, key, keyLabel, mean){
   const yrs = years(obj);
   if(yrs.length >= 2) drawYearChart(id, obj[yrs[0]], obj[yrs[yrs.length-1]], key, keyLabel, mean, yrs[0], yrs[yrs.length-1]);
   else if(yrs.length === 1) drawYearChart(id, obj[yrs[0]], undefined, key, keyLabel, mean);
-  else killChart(id+'-chart');
+  else { killChart(id+'-chart'); killChart(id+'-chart2'); }
 }
 
 const LENGTH_ORDER = ['SHORT','SHORT_OF_A_GOOD_LENGTH','GOOD_LENGTH','FULL','YORKER','FULL_TOSS'];
@@ -407,6 +503,7 @@ function llCells(rowsA, rowsB, mean, keyFn){
     const a=mapA[k], b=mapB[k];
     cells.push({
       key:k, pctA:a?a.pct:0, pctB:b?b.pct:0, deltaPct:(b?b.pct:0)-(a?a.pct:0),
+      implA: (a && mean!=null) ? relImpact(a,mean) : null, implB: (b && mean!=null) ? relImpact(b,mean) : null,
       deltaImpl: (a && b && mean!=null) ? relImpact(b,mean)-relImpact(a,mean) : null,
       deltaSe: combineSe(a?a.se:null, b?b.se:null),
     });
@@ -462,8 +559,9 @@ function drawLLDiffGrid(id, rowsA, rowsB, mean, yrA, yrB){
       if(!c){ t+='<td>–</td>'; return; }
       const alpha = Math.min(1, Math.abs(c.deltaPct)/maxAbs);
       const bg = c.deltaPct>=0 ? `rgba(63,178,127,${0.15+0.6*alpha})` : `rgba(226,86,79,${0.15+0.6*alpha})`;
-      const implTxt = c.deltaImpl!=null ? `<br><span class="muted">Δimpact ${fmt(c.deltaImpl)}${c.deltaSe!=null?' ±'+fmt(c.deltaSe):''}</span>` : '';
-      t += `<td style="background:${bg}">${c.deltaPct>=0?'+':''}${c.deltaPct.toFixed(1)}pp${implTxt}</td>`;
+      const implTxt = (c.implA!=null || c.implB!=null)
+        ? `<br><span class="muted">Impact ${fromTo(c.implA, c.implB)}`+(c.deltaImpl!=null ? ` (Δ ${sgn2(c.deltaImpl)}${c.deltaSe!=null?' ±'+fmt(c.deltaSe):''})` : '')+`</span>` : '';
+      t += `<td style="background:${bg}">${c.deltaPct>=0?'+':''}${c.deltaPct.toFixed(1)}pp<br><span class="muted">${c.pctA.toFixed(1)}% → ${c.pctB.toFixed(1)}%</span>${implTxt}</td>`;
     });
     t += '</tr>';
   });
@@ -471,7 +569,7 @@ function drawLLDiffGrid(id, rowsA, rowsB, mean, yrA, yrB){
   document.getElementById(id+'-tbl').innerHTML = t;
   const idx = llChangeIndex(cells);
   const box = document.getElementById(id+'-idx');
-  if(box) box.innerHTML = `<b>Change index: ${idx.toFixed(1)}</b> — ${idx.toFixed(1)}% of deliveries moved to a different length/line cell from ${yrA} to ${yrB} (0 = identical grid, 100 = totally different). Δimpact figures show ± combined standard error where both seasons have data.`;
+  if(box) box.innerHTML = `<b>Change index: ${idx.toFixed(1)}</b> — ${idx.toFixed(1)}% of deliveries moved to a different length/line cell from ${yrA} to ${yrB} (0 = identical grid, 100 = totally different). Each cell shows the share and Impact in both seasons, then the change; ± is the combined standard error where both seasons have data.`;
 }
 
 function renderVariation(id, obj, mean=0, overall=null, leagueOverall=null){
@@ -551,7 +649,7 @@ function renderTeam(team){
 const ipYears = Array.from(new Set(DATA.impact_player.map(e=>e.year))).sort();
 document.getElementById('ipYear').innerHTML += ipYears.map(y=>`<option value="${y}">${y}</option>`).join('');
 document.getElementById('ipTeam').innerHTML += DATA.team_names.map(t=>`<option value="${t}">${t}</option>`).join('');
-['ipYear','ipTeam','ipSort'].forEach(id=> document.getElementById(id).onchange = renderImpactPlayer);
+['ipYear','ipTeam','ipSort','ipMetric'].forEach(id=> document.getElementById(id).onchange = renderImpactPlayer);
 function renderImpactPlayer(){
   const yr = document.getElementById('ipYear').value, tm = document.getElementById('ipTeam').value, sort = document.getElementById('ipSort').value;
   let rows = DATA.impact_player.filter(e=> (yr==='all'||e.year==yr) && (tm==='all'||e.team===tm));
@@ -582,7 +680,7 @@ function renderImpactPlayer(){
   ], rows.slice(0,150));
   const distRows = impactGroups().map(g=>{
     const values = DATA.impact_player.filter(e=>e.year===g.year && e.team_role===g.role)
-      .map(e=>e.substitution_effect).filter(Number.isFinite).sort((a,b)=>a-b);
+      .map(ipMetricVal).filter(Number.isFinite).sort((a,b)=>a-b);
     return distributionRow(`${g.year} ${g.role}`, values);
   }).join('');
   document.getElementById('ipDistTable').innerHTML = distributionHeader('Year / Innings') + distRows;
@@ -602,28 +700,67 @@ function impactGroups(){
 }
 
 function renderImpactDistributionChart(){
-  const values = DATA.impact_player.map(e=>e.substitution_effect).filter(Number.isFinite);
-  if(!values.length) return;
-  const min = Math.floor(Math.min(...values)), max = Math.ceil(Math.max(...values));
-  const binCount = 12, width = Math.max(1, (max-min)/binCount);
-  const labels = Array.from({length:binCount}, (_,i)=>fmt(min+(i+.5)*width));
-  const groups = impactGroups();
-  const datasets = groups.map(g=>{
-    const counts = Array(binCount).fill(0);
-    const groupRows = DATA.impact_player.filter(e=>e.year===g.year && e.team_role===g.role && Number.isFinite(e.substitution_effect));
-    if(groupRows.length < 10) return null;
-    groupRows.forEach(e=>{
-      const index = Math.min(binCount-1, Math.max(0, Math.floor((e.substitution_effect-min)/width)));
-      counts[index]++;
+  const cv = document.getElementById('ipRidge'); if(!cv) return;
+  const groups = impactGroups().map(g=>{ const evs = DATA.impact_player.filter(e=>e.year===g.year && e.team_role===g.role && Number.isFinite(ipMetricVal(e)));
+    return {...g, evs, vals: evs.map(e=>ipMetricVal(e)).sort((a,b)=>a-b)}; }).filter(g=>g.vals.length>=5);
+  if(!groups.length) return;
+  const all = groups.flatMap(g=>g.vals), n = all.length;
+  const mean = all.reduce((s,v)=>s+v,0)/n, sd = Math.sqrt(all.reduce((s,v)=>s+(v-mean)**2,0)/n)||1;
+  const bw = 0.9*sd*Math.pow(n,-0.2);
+  const lo = Math.min(...all)-2.5*bw, hi = Math.max(...all)+2.5*bw, N = 240;
+  const xs = Array.from({length:N}, (_,i)=>lo+(hi-lo)*i/(N-1));
+  groups.forEach(g=>{ g.d = xs.map(x=> g.vals.reduce((s,v)=> s+Math.exp(-0.5*((x-v)/bw)**2),0)/(g.vals.length*bw*Math.sqrt(2*Math.PI))); });
+  const dmax = Math.max(...groups.map(g=>Math.max(...g.d)));
+  const jit = e=>{ let h = (e.match*2654435761 + (e.player_in||'').length*40503) >>> 0; h ^= h>>>13; h = Math.imul(h,0x5bd1e995)>>>0; return (h%1000)/1000; };
+  const tip = document.getElementById('ipRidgeTip'), wrap = document.getElementById('ipRidgeWrap');
+  const draw = ()=>{
+    const css = getComputedStyle(document.documentElement), col = v=> (css.getPropertyValue(v)||'').trim() || '#888';
+    const W = wrap.clientWidth || 700, dpr = window.devicePixelRatio||1;
+    const rowH = 78, overlap = 1.4, rain = 24, padL = 150, padR = 24, padT = 16, padB = 36, tm = document.getElementById('ipTeam').value;
+    const H = padT + rowH*(groups.length-1) + rowH*overlap + rain + padB;
+    cv.width = W*dpr; cv.height = H*dpr; cv.style.height = H+'px';
+    const ctx = cv.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+    const X = x=> padL + (x-lo)/(hi-lo)*(W-padL-padR), base0 = padT + rowH*overlap, FONT = '-apple-system,Segoe UI,Roboto,Arial,sans-serif';
+    ctx.font = '12px '+FONT; ctx.strokeStyle = col('--border'); ctx.fillStyle = col('--muted'); ctx.lineWidth = 1; ctx.textAlign = 'center';
+    const step = Math.pow(10, Math.floor(Math.log10((hi-lo)/6))), tk = [1,2,5].map(m=>m*step).find(t=>(hi-lo)/t<=9) || step*10;
+    for(let t=Math.ceil(lo/tk)*tk; t<=hi; t+=tk){ ctx.beginPath(); ctx.moveTo(X(t),padT); ctx.lineTo(X(t),H-padB+4); ctx.stroke(); ctx.fillText(fmt(t), X(t), H-padB+18); }
+    ctx.fillText((document.getElementById('ipMetric').value==='oe' ? 'Impact over expected for the substituted slot (runs, vs team median)' : 'Substitution effect vs mean same-role teammate (runs)'), padL+(W-padL-padR)/2, H-4);
+    ctx.setLineDash([5,4]); ctx.strokeStyle = col('--text'); ctx.beginPath(); ctx.moveTo(X(0),padT); ctx.lineTo(X(0),H-padB+4); ctx.stroke(); ctx.setLineDash([]);
+    cv._dots = [];
+    groups.forEach((g,i)=>{
+      const base = base0 + rowH*i, amp = rowH*overlap/dmax;
+      ctx.beginPath(); ctx.moveTo(X(xs[0]), base); xs.forEach((x,k)=> ctx.lineTo(X(x), base-g.d[k]*amp)); ctx.lineTo(X(xs[N-1]), base); ctx.closePath();
+      ctx.fillStyle = g.color+'99'; ctx.fill(); ctx.strokeStyle = g.color; ctx.lineWidth = 1.6; ctx.stroke();
+      ctx.strokeStyle = col('--border'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(padL,base); ctx.lineTo(W-padR,base); ctx.stroke();
+      const med = g.vals[Math.floor((g.vals.length-1)/2)], dm = g.d[xs.findIndex(x=>x>=med)]||0;
+      ctx.strokeStyle = col('--text'); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(X(med),base); ctx.lineTo(X(med),base-dm*amp); ctx.stroke();
+      ctx.textAlign = 'right'; ctx.fillStyle = col('--text'); ctx.font = '600 12px '+FONT; ctx.fillText(`${g.year} · ${g.role}`, padL-10, base-6);
+      ctx.fillStyle = col('--muted'); ctx.font = '11px '+FONT; ctx.fillText(`n=${g.vals.length}, median ${fmt(med)}`, padL-10, base+8); ctx.textAlign = 'center';
+      g.evs.forEach(e=> cv._dots.push({x:X(ipMetricVal(e)), y:base+7+jit(e)*(rain-12), e, g, on: tm==='all'||e.team===tm}));
     });
-    return {label:`${g.year} ${g.role}`, data:counts, backgroundColor:g.color+'99', borderColor:g.color, borderWidth:1};
-  }).filter(Boolean);
-  safeChart('ipDistChart', 'ipDistChart', {
-    type:'bar', data:{labels, datasets},
-    options:{responsive:true, maintainAspectRatio:false,
-      plugins:{tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${ctx.raw} events`}}},
-      scales:{x:{title:{display:true,text:'Impact vs role mean (runs)'}}, y:{beginAtZero:true,title:{display:true,text:'Substitution events'}}}}
-  });
+    // rain drawn last so dots sit on top of the neighbouring cloud
+    cv._dots.forEach(d=>{ ctx.globalAlpha = d.on ? 1 : .18; ctx.beginPath(); ctx.arc(d.x,d.y,d===cv._hover?5:3,0,6.283);
+      ctx.fillStyle = d.g.color; ctx.fill(); ctx.lineWidth = d===cv._hover?2:1; ctx.strokeStyle = d===cv._hover?col('--text'):col('--card'); ctx.stroke(); });
+    ctx.globalAlpha = 1;
+  };
+  cv._draw = draw; draw();
+  if(!cv._ev){
+    cv._ev = true;
+    const move = ev=>{
+      const r = cv.getBoundingClientRect(), mx = ev.clientX-r.left, my = ev.clientY-r.top; let best = null, bd = 64;
+      (cv._dots||[]).forEach(d=>{ const dd = (d.x-mx)**2+(d.y-my)**2; if(dd<bd){ bd = dd; best = d; } });
+      if(best!==cv._hover){ cv._hover = best; cv._draw(); }
+      if(!best){ tip.style.display = 'none'; cv.style.cursor = 'default'; return; }
+      const e = best.e; cv.style.cursor = 'pointer';
+      tip.innerHTML = `<b>${e.player_in}</b> in for ${e.player_out}<br>${e.team} vs ${e.opponent} · ${e.date.slice(0,10)}<br>${best.g.year} · ${best.g.role} · ${e.slot_role}<br>Effect <b class="${ipMetricVal(e)>=0?'pos':'neg'}">${fmt(ipMetricVal(e))}</b> <span class="muted">${document.getElementById('ipMetric').value==='oe' ? `(bat ${fmt(e.bat_oe)} over ${e.bat_balls} balls, bowl ${fmt(e.bowl_oe)} over ${e.bowl_balls} balls; vs ${e.team} median)` : `(bat ${fmt(e.batting_vs_mean)}, bowl ${fmt(e.bowling_vs_mean)})`}</span>`;
+      tip.style.display = 'block';
+      const tw = tip.offsetWidth, W = wrap.clientWidth; tip.style.left = Math.max(0, Math.min(W-tw, best.x+12))+'px'; tip.style.top = (best.y+14)+'px';
+    };
+    cv.addEventListener('pointermove', move); cv.addEventListener('pointerdown', move);
+    cv.addEventListener('pointerleave', ()=>{ cv._hover = null; tip.style.display = 'none'; cv._draw&&cv._draw(); });
+    if(typeof ResizeObserver!=='undefined') new ResizeObserver(()=>cv._draw&&cv._draw()).observe(wrap);
+    document.querySelectorAll('.tab').forEach(t=> t.addEventListener('click', ()=> setTimeout(()=>cv._draw&&cv._draw(),30)));
+  }
 }
 
 // ============================================================ AUCTION
@@ -811,3 +948,272 @@ function renderMovers(){
   renderMoversCorrelation(rows, role);
 }
 safeRun(renderMovers, 'movers');
+
+// ============================================================ MATCHUP MODEL (Compare Players + Matchup Shifts)
+// DATA.matchups holds, per scope (2023 / 2024 / all), an additive shrinkage model per outcome:
+// league effects + each batter's shrunk effect overall / vs style / length / line / speed band.
+// A bowler is {sty, len[6], line[4], spd[4]} = style + share of deliveries at each length/line/speed band.
+const MU = DATA.matchups, MS = MU.scopes, LV = MU.levels;
+const SCOPES = ['2023','2024','all'], SCOPE_LBL = {'2023':'2023','2024':'2024','all':'Both years pooled'};
+const OUTC = {runs:{label:'Strike rate (runs/100 balls)', short:'SR', lowGood:false},
+              impact:{label:'Impact / 100 balls', short:'Impact/100', lowGood:false},
+              wkt:{label:'Dismissals / 100 balls', short:'Dismissals/100', lowGood:true}};
+const dotp = (a,w)=> a.reduce((s,v,i)=>s+v*w[i],0);
+const oneHot = (n,i)=> Array.from({length:n},(_,k)=>k===i?1:0);
+const interp = (n,pos)=>{ const w=Array(n).fill(0), p=Math.min(n-1,Math.max(0,pos)), lo=Math.floor(p), f=p-lo; w[lo]+=1-f; if(f>0) w[Math.min(n-1,lo+1)]+=f; return w; };
+const spdBand = kph=> kph>=130?0 : kph>=110?1 : kph>=85?2 : 3;
+// batter-specific part only: how much better/worse than the AVERAGE batter of the same hand facing this same mix
+function batEdge(scope, oc, name, p){
+  const b = MS[scope].model[oc].bat[name]; if(!b) return null;
+  return 100*(b.b + b.s[p.sty] + dotp(b.l,p.len) + dotp(b.n,p.line) + dotp(b.p,p.spd));
+}
+// full predicted outcome per 100 balls (league baseline for this hand/profile + batter edge); name=null -> average batter
+// bowler's own shrunk effect (beyond style + mix) vs batters of this hand, in batter-outcome units per 100 balls
+function bowEffN(scope, oc, w, hand){ const b = w && MS[scope].model[oc].bow[w]; return b ? 100*(b.b + b.h[hand==='L'?1:0]) : null; }
+// full predicted outcome per 100 balls: league baseline (hand, style, mix) + batter edge (null = average batter) + bowler effect (null = average bowler)
+function predict(scope, oc, name, hand, p, w){
+  const m = MS[scope].model[oc], lg = m.lg, h = hand==='L'?1:0;
+  const base = m.ic + lg.hand[h] + lg.sty[p.sty] + lg.hs[h][p.sty] + dotp(lg.len,p.len) + dotp(lg.hl[h],p.len) + dotp(lg.line,p.line) + dotp(lg.hn[h],p.line) + dotp(lg.spd,p.spd);
+  let v = 100*base;
+  if(name){ const e = batEdge(scope, oc, name, p); if(e==null) return null; v += e; }
+  const be = bowEffN(scope, oc, w, hand); if(be!=null) v += be;
+  return v;
+}
+const f1 = v=> v==null||!Number.isFinite(v) ? '–' : v.toFixed(1);
+const sgn = v=> v==null||!Number.isFinite(v) ? '–' : (v>=0?'+':'')+v.toFixed(1);
+// bp=true -> bowler's perspective (values already sign-flipped for Impact): fewer runs / more wickets / more bowling Impact are good
+const isGood = (v, oc, bp)=> bp ? (oc==='runs' ? v<=0 : v>=0) : (OUTC[oc].lowGood ? v<=0 : v>=0);
+const goodCls = (v, oc, bp)=> v==null ? '' : (isGood(v,oc,bp) ? 'pos' : 'neg');
+function heatBg(v, oc, scale, bp){
+  if(v==null) return '';
+  const good = isGood(v, oc, bp), a = Math.min(1, Math.abs(v)/scale);
+  return `background:${good?'rgba(63,178,127,':'rgba(226,86,79,'}${0.12+0.55*a})`;
+}
+
+// ---------- Compare Players ----------
+const batByBalls = Object.keys(MS.all.bat).sort((a,b)=>MS.all.bat[b].balls-MS.all.bat[a].balls);
+const bowlAll = Object.keys(MS.all.bowl).sort((a,b)=>MS.all.bowl[b].balls-MS.all.bowl[a].balls);
+document.getElementById('cmpBatList').innerHTML = batByBalls.map(n=>`<option value="${n}">`).join('');
+document.getElementById('cmpBowlList').innerHTML = bowlAll.map(n=>`<option value="${n}">`).join('');
+document.getElementById('cmpStyle').innerHTML = LV.sty.map((s,i)=>`<option value="${i}">${s}</option>`).join('');
+document.getElementById('cmpA').value = batByBalls[0]; document.getElementById('cmpB').value = batByBalls[1];
+document.getElementById('cmpBowl').value = bowlAll[0];
+document.getElementById('cmpStyle').value = '0';
+['cmpMode','cmpOutcome','cmpSrc','cmpStyle','cmpLen','cmpLine','cmpSpd','cmpA','cmpB','cmpBowl'].forEach(id=>{
+  const el = document.getElementById(id); el.addEventListener('input', renderCompare); el.addEventListener('change', renderCompare);
+});
+function customProfile(){
+  const L = +document.getElementById('cmpLen').value, N = +document.getElementById('cmpLine').value, K = +document.getElementById('cmpSpd').value;
+  return { sty:+document.getElementById('cmpStyle').value, len: interp(6, L-1), line: interp(4, N-1), spd: oneHot(4, spdBand(K)), _L:L, _N:N, _K:K };
+}
+function profileFor(scope){   // real bowler: that scope's own mix (fallback to pooled if too few balls that year)
+  if(document.getElementById('cmpSrc').value==='custom') return {p:customProfile(), note:''};
+  const nm = document.getElementById('cmpBowl').value, sc = MS[scope].bowl[nm];
+  if(sc) return {p:sc, note:''};
+  const al = MS.all.bowl[nm]; return al ? {p:al, note:'(<30 balls that year — pooled mix used)'} : {p:null, note:''};
+}
+function renderCompareBat(){
+  const mode = document.getElementById('cmpMode').value, oc = document.getElementById('cmpOutcome').value;
+  const custom = document.getElementById('cmpSrc').value==='custom';
+  document.getElementById('cmpB').style.display = mode==='bvbat' ? '' : 'none';
+  document.getElementById('cmpCustom').style.display = custom ? '' : 'none';
+  document.getElementById('cmpBowl').style.display = custom ? 'none' : '';
+  const cp = customProfile();
+  document.getElementById('cmpLenLbl').textContent = `${cp._L.toFixed(1)} (${LV.len[Math.round(cp._L)-1].replace(/_/g,' ').toLowerCase()})`;
+  document.getElementById('cmpLineLbl').textContent = `${cp._N.toFixed(1)} (${LV.line[Math.round(cp._N)-1].replace(/_/g,' ').toLowerCase()})`;
+  document.getElementById('cmpSpdLbl').textContent = `${cp._K} kph (${LV.spd[spdBand(cp._K)]} band)`;
+  const out = document.getElementById('cmpOut');
+  const A = document.getElementById('cmpA').value, B = document.getElementById('cmpB').value;
+  const bats = mode==='bvbat' ? [A,B] : [A];
+  if(bats.some(n=>!MS.all.bat[n])){ out.innerHTML = '<p class="muted">Pick batter(s) from the list (batters with at least 30 balls faced).</p>'; return; }
+  if(!custom && !MS.all.bowl[document.getElementById('cmpBowl').value]){ out.innerHTML = '<p class="muted">Pick a bowler from the list (at least 30 balls bowled).</p>'; return; }
+  const hand = n=> MS.all.bat[n].hand;
+  const prof0 = profileFor('all').p;
+  document.getElementById('cmpProfileInfo').innerHTML = custom ? '' :
+    `${LV.sty[prof0.sty]} · ${prof0.balls} balls · avg length ${(dotp(prof0.len,[1,2,3,4,5,6])).toFixed(1)}/6 · avg line ${(dotp(prof0.line,[1,2,3,4])).toFixed(1)}/4 · 130+kph ${(prof0.spd[0]*100).toFixed(0)}%. Each season column below uses that season's own mix for the bowler.`;
+  const wn = custom ? null : document.getElementById('cmpBowl').value;
+  // main table: one row per scope
+  const rows = SCOPES.map(sc=>{
+    const {p, note} = profileFor(sc); if(!p) return null;
+    const r = {sc, note};
+    bats.forEach((n,i)=>{ const inS = !!MS[sc].model[oc].bat[n]; r['v'+i] = inS ? predict(sc,oc,n,hand(n),p,wn) : null;
+      r['e'+i] = inS ? batEdge(sc,oc,n,p) : null; r['b'+i] = inS ? MS[sc].bat[n].balls : 0; r['s'+i] = inS ? MS[sc].bat[n].sty[p.sty] : 0;
+      r['avg'+i] = predict(sc,oc,null,hand(n),p,wn); });
+    r.bw = wn ? bowEffN(sc,oc,wn,hand(bats[0])) : null;
+    return r;
+  }).filter(Boolean);
+  let html = `<div class="section"><h3>${mode==='bvb' ? `${A} vs ${custom?'custom profile':document.getElementById('cmpBowl').value}` : `${A} vs ${B}`} — ${OUTC[oc].label}</h3>`;
+  html += `<div class="chart-wrap"><canvas id="cmpChart"></canvas></div>`;
+  html += '<table style="margin-top:10px"><tr><th>Season</th>' + bats.map(n=>`<th>${n} predicted</th><th>vs avg ${hand(n)}HB</th><th>Balls (vs this style)</th>`).join('') + (mode==='bvbat'?'<th>A − B</th>':'') + '</tr>';
+  rows.forEach(r=>{
+    html += `<tr><td><b>${SCOPE_LBL[r.sc]}</b> <span class="muted">${r.note}</span>${r.bw!=null?`<br><span class="muted">bowler effect ${sgn(r.bw)}</span>`:''}</td>`;
+    bats.forEach((n,i)=>{ html += `<td>${f1(r['v'+i])}</td><td class="${goodCls(r['e'+i],oc)}">${sgn(r['e'+i])}</td><td class="muted">${r['b'+i]||'<30'} (${r['s'+i]})</td>`; });
+    if(mode==='bvbat'){ const d = (r.v0!=null&&r.v1!=null) ? r.v0-r.v1 : null; html += `<td class="${goodCls(d,oc)}"><b>${sgn(d)}</b></td>`; }
+    html += '</tr>';
+  });
+  html += `</table><p class="note">“Predicted” = league baseline for a batter of that hand vs this delivery mix plus the batter's shrunk matchup edge and, for a real bowler, that bowler's own shrunk effect (shown under the season). “vs avg” isolates the batter's edge over an average same-hand batter. Green = favours the batter (for dismissals, fewer is better). Edges are shrunk toward zero for small samples, so treat gaps under ~3 SR points as noise.</p></div>`;
+  // breakdown by delivery type, per season
+  const dims = [['Style',LV.sty,'s'],['Length',LV.len.map(x=>x.replace(/_/g,' ').toLowerCase()),'l'],['Line',LV.line.map(x=>x.replace(/_/g,' ').toLowerCase()),'n'],['Speed',LV.spd,'p']];
+  const sc2 = ['2023','2024'];
+  let scale = 0.01; bats.forEach(n=>sc2.forEach(sc=>{ const b = MS[sc].model[oc].bat[n]; if(b) dims.forEach(d=>b[d[2]].forEach(v=>{scale=Math.max(scale,Math.abs(v*100));})); }));
+  scale = Math.max(scale*0.7, 0.5);
+  html += `<div class="section"><h3>Where each batter's edge comes from, by season</h3><table class="grid-heat"><tr><th>Delivery type</th>` +
+    bats.map(n=>sc2.map(sc=>`<th>${n}<br>${sc}</th>`).join('')).join('') + '</tr>';
+  dims.forEach(([dn,labels,k])=>{
+    labels.forEach((lb,i)=>{
+      html += `<tr><th style="text-align:left">${i===0?`<span class="pill">${dn}</span> `:''}${lb}</th>`;
+      bats.forEach(n=> sc2.forEach(sc=>{ const b = MS[sc].model[oc].bat[n]; const v = b ? b[k][i]*100 : null;
+        html += `<td style="${heatBg(v,oc,scale)}">${sgn(v)}</td>`; }));
+      html += '</tr>';
+    });
+  });
+  html += `</table><p class="note">Each cell = the batter's shrunk effect (${OUTC[oc].short}) vs an average same-hand batter against that delivery type, separately for each season — compare the 2023 and 2024 columns to see what changed. “–” = fewer than 30 balls that season.</p></div>`;
+  out.innerHTML = html;
+  killChart('cmpChart');
+  const palette = ['#5b8cff','#f2b84b'];
+  const ds = bats.map((n,i)=>({label:n, data: rows.map(r=>r['v'+i]), backgroundColor: palette[i]+'cc'}));
+  if(mode==='bvb') ds.push({label:'Average '+hand(A)+'HB (same mix)', data: rows.map(r=>r.avg0), backgroundColor:'rgba(154,162,177,.6)'});
+  safeChart('cmpChart','cmpChart',{type:'bar', data:{labels: rows.map(r=>SCOPE_LBL[r.sc]), datasets:ds},
+    options:{responsive:true, maintainAspectRatio:false, scales:{y:{title:{display:true,text:OUTC[oc].label}}}}});
+}
+
+document.getElementById('cmpBX').value = bowlAll[0]; document.getElementById('cmpBY').value = bowlAll[1];
+['cmpBX','cmpBY','cmpCtx'].forEach(id=>{ const el = document.getElementById(id); el.addEventListener('input', renderCompare); el.addEventListener('change', renderCompare); });
+function renderCompare(){
+  const mode = document.getElementById('cmpMode').value, bm = mode==='bowl' || mode==='bowlbowl';
+  document.getElementById('cmpProfileSec').style.display = bm ? 'none' : '';
+  document.getElementById('cmpBowlerRow').style.display = bm ? '' : 'none';
+  if(!bm){ document.getElementById('cmpA').style.display = ''; return renderCompareBat(); }
+  document.getElementById('cmpB').style.display = 'none';
+  document.getElementById('cmpA').style.display = document.getElementById('cmpCtx').value==='batter' ? '' : 'none';
+  document.getElementById('cmpBY').style.display = mode==='bowlbowl' ? '' : 'none';
+  renderCompareBowl(mode);
+}
+// Bowler's view: everything is shown as the bowler would read it (runs conceded, wickets, bowling Impact = -batter Impact).
+function renderCompareBowl(mode){
+  const oc = document.getElementById('cmpOutcome').value, out = document.getElementById('cmpOut'), ctx = document.getElementById('cmpCtx').value, A = document.getElementById('cmpA').value;
+  const ws = [document.getElementById('cmpBX').value].concat(mode==='bowlbowl' ? [document.getElementById('cmpBY').value] : []);
+  if(ws.some(w=>!MS.all.bowl[w])){ out.innerHTML = '<p class="muted">Pick bowler(s) from the list (at least 30 balls bowled).</p>'; return; }
+  if(ctx==='batter' && !MS.all.bat[A]){ out.innerHTML = '<p class="muted">Pick Batter A from the list, or choose an average right/left-hander.</p>'; return; }
+  const bn = ctx==='batter' ? A : null, hand = ctx==='batter' ? MS.all.bat[A].hand : ctx, hi = hand==='L'?1:0, sg = oc==='impact' ? -1 : 1;
+  const lab = {runs:'Runs conceded / 100 balls', impact:'Bowling Impact / 100 balls', wkt:'Wickets / 100 balls'}[oc];
+  const ctxLbl = bn || `an average ${hand==='R'?'right':'left'}-hander`;
+  const rows = SCOPES.map(sc=>{ const r = {sc};
+    ws.forEach((w,i)=>{ const own = MS[sc].bowl[w], p = own || MS.all.bowl[w], inS = !!MS[sc].model[oc].bow[w];
+      const full = predict(sc,oc,bn,hand,p,inS?w:null), base = predict(sc,oc,bn,hand,p,null);
+      r['v'+i] = full==null ? null : sg*full; r['avg'+i] = base==null ? null : sg*base;
+      r['e'+i] = inS ? sg*bowEffN(sc,oc,w,hand) : null; r['b'+i] = own ? own.balls : 0; });
+    return r; });
+  let html = `<div class="section"><h3>${ws.join(' vs ')} facing ${ctxLbl} — ${lab}</h3><div class="chart-wrap"><canvas id="cmpChart"></canvas></div>`;
+  html += '<table style="margin-top:10px"><tr><th>Season</th>' + ws.map(w=>`<th>${w} predicted</th><th>Bowler effect vs avg bowler</th><th>Balls bowled</th>`).join('') + (ws.length>1?'<th>X − Y</th>':'') + '</tr>';
+  rows.forEach(r=>{ html += `<tr><td><b>${SCOPE_LBL[r.sc]}</b></td>`;
+    ws.forEach((w,i)=>{ html += `<td>${f1(r['v'+i])}</td><td class="${goodCls(r['e'+i],oc,true)}">${sgn(r['e'+i])}</td><td class="muted">${r['b'+i]||'<30'}</td>`; });
+    if(ws.length>1){ const d = (r.v0!=null&&r.v1!=null) ? r.v0-r.v1 : null; html += `<td class="${goodCls(d,oc,true)}"><b>${sgn(d)}</b></td>`; }
+    html += '</tr>'; });
+  html += `</table><p class="note">Predicted = league baseline for ${ctxLbl} against each bowler's own mix of length/line/speed that season, plus ${bn?"the batter's shrunk edge against that mix, plus ":''}the bowler's own shrunk effect vs ${hand==='R'?'right':'left'}-handers. “Bowler effect” isolates that last piece (what he adds beyond his style and where he bowls). Green = good for the bowler (fewer runs, more wickets, more Impact). Treat gaps under ~3 runs/100 as noise.</p></div>`;
+  // effect vs batter hand, per season
+  const sc2 = ['2023','2024']; let scale = 0.5;
+  ws.forEach(w=>sc2.forEach(sc=>{ const b = MS[sc].model[oc].bow[w]; if(b) [b.b+b.h[0], b.b+b.h[1]].forEach(v=>{ scale = Math.max(scale, Math.abs(v*100)*0.7); }); }));
+  html += `<div class="section"><h3>Bowler effect by batter hand, per season</h3><table class="grid-heat"><tr><th>Facing</th>` + ws.map(w=>sc2.map(sc=>`<th>${w}<br>${sc}</th>`).join('')).join('') + '</tr>';
+  [['Right-handers',0],['Left-handers',1]].forEach(([lb,k])=>{ html += `<tr><th style="text-align:left">${lb}</th>`;
+    ws.forEach(w=>sc2.forEach(sc=>{ const b = MS[sc].model[oc].bow[w], v = b ? sg*100*(b.b+b.h[k]) : null; html += `<td style="${heatBg(v,oc,scale,true)}">${sgn(v)}</td>`; })); html += '</tr>'; });
+  html += `</table><p class="note">Shrunk effect in ${lab.toLowerCase()} vs an average bowler of the same style and mix. “–” = fewer than 30 balls that season.</p></div>`;
+  // where he bowls + how well that works vs this hand (league-wide)
+  const lg = MS.all.model[oc].lg;
+  const dims = [['Length',LV.len.map(x=>x.replace(/_/g,' ').toLowerCase()),'len',lg.len.map((v,i)=>v+lg.hl[hi][i])],
+                ['Line',LV.line.map(x=>x.replace(/_/g,' ').toLowerCase()),'line',lg.line.map((v,i)=>v+lg.hn[hi][i])],
+                ['Speed',LV.spd,'spd',lg.spd]];
+  const vs = dims.flatMap(d=>d[3]).map(v=>Math.abs(v*100)); const sc3 = Math.max(0.5, Math.max(...vs)*0.8);
+  html += `<div class="section"><h3>Where each bowler bowls, per season</h3><table class="grid-heat"><tr><th>Delivery type</th>` + ws.map(w=>sc2.map(sc=>`<th>${w}<br>${sc} share</th>`).join('')).join('') + `<th>League value vs ${hand==='R'?'right':'left'}-handers<br>(${lab.replace(' / 100 balls','')})</th></tr>`;
+  dims.forEach(([dn,labels,k,val])=> labels.forEach((lb,i)=>{
+    html += `<tr><th style="text-align:left">${i===0?`<span class="pill">${dn}</span> `:''}${lb}</th>`;
+    ws.forEach(w=>sc2.forEach(sc=>{ const p = MS[sc].bowl[w]; html += `<td>${p ? (p[k][i]*100).toFixed(0)+'%' : '–'}</td>`; }));
+    const v = sg*100*val[i]; html += `<td style="${heatBg(v,oc,sc3,true)}">${sgn(v)}</td></tr>`; }));
+  html += `</table><p class="note">Share = % of that bowler's deliveries (that season) at each length / line / speed band. The last column is what the league as a whole gets from that delivery type against this hand, relative to an average delivery (green = good for the bowler) — a quick read on whether he is bowling where it works.</p></div>`;
+  out.innerHTML = html;
+  killChart('cmpChart');
+  const pal = ['#5b8cff','#f2b84b'];
+  const ds = ws.map((w,i)=>({label:w, data:rows.map(r=>r['v'+i]), backgroundColor:pal[i]+'cc'}));
+  if(ws.length===1) ds.push({label:'Average bowler (same mix)', data:rows.map(r=>r.avg0), backgroundColor:'rgba(154,162,177,.6)'});
+  safeChart('cmpChart','cmpChart',{type:'bar', data:{labels:rows.map(r=>SCOPE_LBL[r.sc]), datasets:ds}, options:{responsive:true, maintainAspectRatio:false, scales:{y:{title:{display:true,text:lab}}}}});
+}
+safeRun(renderCompare,'compare');
+
+// ---------- Matchup Shifts (2023 -> 2024) ----------
+['shView','shOutcome','shMin','shPersp'].forEach(id=> document.getElementById(id).onchange = renderShifts);
+document.getElementById('shView').addEventListener('change',()=>{ document.getElementById('shPersp').value = ['bhand','bmix'].includes(document.getElementById('shView').value) ? 'bowl' : 'bat'; renderShifts(); });
+document.getElementById('shFilter').addEventListener('input', renderShifts);
+const typicalStyleProfile = {};
+function styleProfile(s){
+  if(typicalStyleProfile[s]) return typicalStyleProfile[s];
+  const bs = Object.values(MS.all.bowl).filter(b=>b.sty===s), tot = bs.reduce((x,b)=>x+b.balls,0)||1;
+  const avg = k=> bs.length ? bs[0][k].map((_,i)=>bs.reduce((x,b)=>x+b[k][i]*b.balls,0)/tot) : null;
+  return typicalStyleProfile[s] = {sty:s, len:avg('len')||oneHot(6,2), line:avg('line')||oneHot(4,1), spd:avg('spd')||oneHot(4,1)};
+}
+function renderShifts(){
+  const view = document.getElementById('shView').value, oc = document.getElementById('shOutcome').value, bp = document.getElementById('shPersp').value==='bowl';
+  const minB = +document.getElementById('shMin').value, ft = document.getElementById('shFilter').value.trim().toLowerCase();
+  const sg = (bp && oc==='impact') ? -1 : 1, S = v=> v==null ? null : sg*v, a = MS['2023'], b = MS['2024'];
+  const bats = Object.keys(a.bat).filter(n=> b.bat[n] && a.bat[n].balls>=minB && b.bat[n].balls>=minB);
+  const bowls = Object.keys(a.bowl).filter(n=> b.bowl[n] && a.bowl[n].balls>=minB && b.bowl[n].balls>=minB && a.model[oc].bow[n] && b.model[oc].bow[n]);
+  const gc = v=> goodCls(v,oc,bp), edgeCols = (k23,k24)=>[
+    {label:'Edge 2023',get:r=>r[k23],render:r=>sgn(r[k23]),cls:r=>gc(r[k23])},{label:'Edge 2024',get:r=>r[k24],render:r=>sgn(r[k24]),cls:r=>gc(r[k24])}];
+  const dcol = {label:'Δ',get:r=>r.d,render:r=>`<b>${sgn(r.d)}</b>`,cls:r=>gc(r.d)};
+  const nm = (n,w)=> !ft || (n && n.toLowerCase().includes(ft)) || (w && w.toLowerCase().includes(ft));
+  const lbl = s=>s.replace(/_/g,' ').toLowerCase();
+  let cols, rows = [], note;
+  if(view==='pair'){
+    bats.forEach(n=> bowls.forEach(w=>{
+      if(!nm(n,w)) return;
+      const p23 = a.bowl[w], p24 = b.bowl[w], hd = a.bat[n].hand;
+      const v23 = predict('2023',oc,n,hd,p23,w), v24 = predict('2024',oc,n,hd,p24,w);
+      const mix = predict('2023',oc,n,hd,p24,null) - predict('2023',oc,n,hd,p23,null);
+      const env = predict('2024',oc,null,hd,p24,null) - predict('2023',oc,null,hd,p24,null);
+      const bat = batEdge('2024',oc,n,p24) - batEdge('2023',oc,n,p24), bowl = bowEffN('2024',oc,w,hd) - bowEffN('2023',oc,w,hd);
+      if([v23,v24,mix,env,bat,bowl].some(v=>v==null||!Number.isFinite(v))) return;
+      rows.push({n,w,hd,v23:S(v23),v24:S(v24),d:S(v24-v23-env),bat:S(bat),bowl:S(bowl),mix:S(mix),env:S(env)});
+    }));
+    rows.sort((x,y)=>Math.abs(y.d)-Math.abs(x.d)); rows = rows.slice(0,500);
+    cols = [{label:'Batter',get:r=>r.n},{label:'Bowler',get:r=>r.w},{label:'Hand',get:r=>r.hd},
+      {label:'Predicted 2023',get:r=>r.v23,render:r=>f1(r.v23)},{label:'Predicted 2024',get:r=>r.v24,render:r=>f1(r.v24)},
+      {...dcol,label:'Δ excl. league shift'},
+      {label:'…batter changed',get:r=>r.bat,render:r=>sgn(r.bat),cls:r=>gc(r.bat)},{label:'…bowler skill changed',get:r=>r.bowl,render:r=>sgn(r.bowl),cls:r=>gc(r.bowl)},
+      {label:'…bowler mix changed',get:r=>r.mix,render:r=>sgn(r.mix),cls:r=>gc(r.mix)},{label:'League shift (removed)',get:r=>r.env,render:r=>sgn(r.env)}];
+    note = `${bats.length} batters × ${bowls.length} bowlers who qualify in both seasons; top 500 pairs by |Δ excl. league shift|. Predicted = full ${OUTC[oc].short} for that pairing using each season's own bowler mix. The change is split four ways and adds up exactly: the batter's skill changing, the bowler's own skill changing, the bowler moving his length/line/speed mix (incl. how that batter handles the new mix), and the league-wide season shift (removed from the headline Δ).`;
+  } else if(view==='style'){
+    bats.forEach(n=> LV.sty.forEach((sn,s)=>{
+      if(!nm(n)) return; const bs23 = a.bat[n].sty[s], bs24 = b.bat[n].sty[s]; if(bs23<15 || bs24<15) return;
+      const p = styleProfile(s), e23 = S(batEdge('2023',oc,n,p)), e24 = S(batEdge('2024',oc,n,p)); rows.push({n,sn,bs23,bs24,e23,e24,d:e24-e23}); }));
+    rows.sort((x,y)=>Math.abs(y.d)-Math.abs(x.d));
+    cols = [{label:'Batter',get:r=>r.n},{label:'Bowling style',get:r=>r.sn},{label:'Balls 2023',get:r=>r.bs23},{label:'Balls 2024',get:r=>r.bs24},...edgeCols('e23','e24'),dcol];
+    note = `Batter vs the league-typical bowler of each style (same delivery mix both seasons, so purely the batter changing). Needs ≥15 balls vs that style in both seasons.`;
+  } else if(view==='dim'){
+    const dims = [['Length',LV.len.map(lbl),'l'],['Line',LV.line.map(lbl),'n'],['Speed',LV.spd,'p']];
+    bats.forEach(n=>{ if(!nm(n)) return; dims.forEach(([dn,labels,k])=> labels.forEach((lb,i)=>{
+      const e23 = S(a.model[oc].bat[n][k][i]*100), e24 = S(b.model[oc].bat[n][k][i]*100); rows.push({n,dn,lb,e23,e24,d:e24-e23}); })); });
+    rows.sort((x,y)=>Math.abs(y.d)-Math.abs(x.d)); rows = rows.slice(0,500);
+    cols = [{label:'Batter',get:r=>r.n},{label:'Dimension',get:r=>r.dn},{label:'Delivery type',get:r=>r.lb},...edgeCols('e23','e24'),dcol];
+    note = `Change in each batter's shrunk effect vs a length, line or speed band (top 500 by |Δ|). Shrinkage means a big move here had a lot of balls behind it.`;
+  } else if(view==='bhand'){
+    bowls.forEach(w=>{ if(!nm(null,w)) return; [['R',0],['L',1]].forEach(([hn,k])=>{
+      const m23 = a.model[oc].bow[w], m24 = b.model[oc].bow[w], e23 = S(100*(m23.b+m23.h[k])), e24 = S(100*(m24.b+m24.h[k]));
+      rows.push({w,hn:hn==='R'?'Right-handers':'Left-handers',e23,e24,d:e24-e23,b23:a.bowl[w].balls,b24:b.bowl[w].balls}); }); });
+    rows.sort((x,y)=>Math.abs(y.d)-Math.abs(x.d));
+    cols = [{label:'Bowler',get:r=>r.w},{label:'Facing',get:r=>r.hn},{label:'Balls 2023',get:r=>r.b23},{label:'Balls 2024',get:r=>r.b24},
+      {label:'Effect 2023',get:r=>r.e23,render:r=>sgn(r.e23),cls:r=>gc(r.e23)},{label:'Effect 2024',get:r=>r.e24,render:r=>sgn(r.e24),cls:r=>gc(r.e24)},dcol];
+    note = `The bowler's own shrunk effect (beyond his style and mix) against right- and left-handers, each season.`;
+  } else {
+    const lg = MS.all.model[oc].lg, dims = [['Length',LV.len.map(lbl),'len',lg.len.map((v,i)=>(v+(lg.hl[0][i]+lg.hl[1][i])/2))],
+      ['Line',LV.line.map(lbl),'line',lg.line.map((v,i)=>(v+(lg.hn[0][i]+lg.hn[1][i])/2))],['Speed',LV.spd,'spd',lg.spd]];
+    bowls.forEach(w=>{ if(!nm(null,w)) return; dims.forEach(([dn,labels,k,val])=> labels.forEach((lb,i)=>{
+      const s23 = a.bowl[w][k][i]*100, s24 = b.bowl[w][k][i]*100; rows.push({w,dn,lb,s23,s24,d:s24-s23,val:S(100*val[i])}); })); });
+    rows.sort((x,y)=>Math.abs(y.d)-Math.abs(x.d)); rows = rows.slice(0,500);
+    cols = [{label:'Bowler',get:r=>r.w},{label:'Dimension',get:r=>r.dn},{label:'Delivery type',get:r=>r.lb},
+      {label:'Share 2023',get:r=>r.s23,render:r=>r.s23.toFixed(0)+'%'},{label:'Share 2024',get:r=>r.s24,render:r=>r.s24.toFixed(0)+'%'},
+      {label:'Δ share (pp)',get:r=>r.d,render:r=>`<b>${sgn(r.d)}</b>`},{label:'League value of this delivery',get:r=>r.val,render:r=>sgn(r.val),cls:r=>gc(r.val)}];
+    note = `How each bowler moved where he bowls (top 500 by |Δ share|). “League value” = what the whole league gets from that delivery type vs an average delivery (green = good for the bowler), so you can see whether he moved toward or away from what works.`;
+  }
+  document.getElementById('shNote').innerHTML = note + (bp ? ' Bowler\'s perspective: green = good for the bowler (fewer runs, more wickets, more bowling Impact).' : ' Positive Δ = '+(OUTC[oc].lowGood?'more dismissals (worse for the batter)':'better for the batter')+'.')+' Click a header to sort.';
+  renderSortableTable('shTable', cols, rows);
+}
+safeRun(renderShifts,'shifts');

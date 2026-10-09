@@ -16,6 +16,9 @@ Deliberately left in matplotlib:
   * plot_wagon_zone_pies        -- the per-year pie charts of wagon-wheel zone shares
     (plotnine has no coord_polar and no mean-valued hexbin.)
 
+New (no matplotlib original): plot_season_change_pair / plot_season_change_grid draw the dashboard's
+"change between seasons" views -- see section 7b of dl_pro_fit.py.
+
 Changed shape in the plotnine port:
   * plot_fit_diagnostics    -- the two side-by-side matplotlib axes are one faceted plot.
 """
@@ -29,7 +32,7 @@ from plotnine import (
     geom_histogram, geom_path, coord_flip, coord_fixed, facet_wrap, labs, theme, theme_bw,
     theme_minimal, element_text, element_blank, scale_fill_manual, scale_color_manual,
     scale_fill_gradient2, scale_color_cmap, scale_size_continuous, scale_x_continuous,
-    position_dodge, after_stat,
+    position_dodge, after_stat, geom_errorbar,
 )
 
 __all__ = [
@@ -43,6 +46,7 @@ __all__ = [
     "plot_shot_quadrant", "plot_shot_year_comparison", "plot_fit_diagnostics",
     "plot_impact_sub_distribution",
     "plot_impact_sub_distribution_by_year_role",
+    "plot_season_change_pair", "plot_season_change_grid",
 ]
 
 BLUE, RED, GREEN = "#3366cc", "#cc3333", "#33aa55"
@@ -830,4 +834,111 @@ def plot_impact_sub_distribution_by_year_role(perf, outpath, bins=12):
          + labs(title="Impact Player slot effects by year, innings, and category",
                 x="Impact vs role mean (runs)", y="Substitution events", fill="")
          + _base(13, 6) + theme(legend_position="bottom"))
+    _save(p, outpath)
+
+
+# ---------------------------------------------------------------- season-change views (dashboard parity)
+_UP_GREEN, _DOWN_RED, _FIRST_GREY, _NA_BLUE = "#3fb27f", "#e2564f", "#8a93a6", "#5b8cff"
+
+
+def plot_season_change_pair(merged, title, key_label, yr_a, yr_b, outpath):
+    """
+    The dashboard's two-plot "change between seasons" view for one player/team and one category
+    dimension (shot / wagon zone / speed): a grouped bar per category with the FIRST season in grey and
+    the LAST season coloured green (value went up) or red (went down), exactly one number per bar.
+
+      top panel    -- share of deliveries (%)
+      bottom panel -- Impact vs role mean per ball, with each season's standard error as a whisker
+
+    `merged` is one entity's rows from season_change_analysis / merge_season_pair (columns: label,
+    pct_a, pct_b, delta_pct, impact_a, impact_b, delta_impact, se_a, se_b). A category a season never
+    used has no bar in that season. Categories are ordered by the size of the share change.
+    """
+    t = merged.copy()
+    t = t.iloc[np.argsort(-t["delta_pct"].abs().to_numpy(), kind="stable")]
+    order = t["label"].tolist()
+    p_share = "How often: share of deliveries (%)"
+    p_impact = "How well: Impact vs role mean / ball (± SE)"
+    ya, yb = str(int(yr_a)), str(int(yr_b))
+
+    def _dir(delta):
+        return np.where(pd.isna(delta), "na", np.where(delta >= 0, "up", "down"))
+
+    frames = []
+    for panel, a_col, b_col, d_col, se_a, se_b, nd in (
+            (p_share, "pct_a", "pct_b", "delta_pct", None, None, 1),
+            (p_impact, "impact_a", "impact_b", "delta_impact", "se_a", "se_b", 2)):
+        for season, col, se_col, fillkey in ((ya, a_col, se_a, np.full(len(t), "first")),
+                                            (yb, b_col, se_b, _dir(t[d_col]))):
+            f = pd.DataFrame({
+                "label": t["label"].to_numpy(), "panel": panel, "season": season,
+                "fill_key": fillkey, "value": t[col].to_numpy(dtype=float),
+                "se": (t[se_col].to_numpy(dtype=float) if se_col else np.full(len(t), np.nan)),
+            })
+            if panel == p_share:
+                f.loc[f["value"] <= 0, "value"] = np.nan        # unused that season -> no bar (not a bar of 0)
+            f = f.dropna(subset=["value"])
+            f["lab"] = f["value"].map(lambda v, nd=nd: f"{v:.{nd}f}")
+            f["ymin"] = f["value"] - f["se"]
+            f["ymax"] = f["value"] + f["se"]
+            sev = f["se"].fillna(0.0)
+            f["label_y"] = np.where(f["value"] >= 0, f["value"] + sev, f["value"] - sev)
+            frames.append(f)
+    long = pd.concat(frames, ignore_index=True)
+    long["label"] = pd.Categorical(long["label"], categories=order, ordered=True)
+    long["panel"] = pd.Categorical(long["panel"], categories=[p_share, p_impact], ordered=True)
+    pos, neg = long[long["value"] >= 0], long[long["value"] < 0]
+    err = long[long["se"].notna()]
+
+    p = (ggplot(long, aes("label", "value", fill="fill_key", group="season"))
+         + geom_col(position=position_dodge(width=0.8), width=0.75)
+         + geom_hline(yintercept=0, color="black", size=0.4))
+    if len(err):
+        p = p + geom_errorbar(err, aes(x="label", ymin="ymin", ymax="ymax", group="season"),
+                              inherit_aes=False, position=position_dodge(width=0.8), width=0.25)
+    if len(pos):
+        p = p + geom_text(pos, aes(x="label", y="label_y", label="lab", group="season"), inherit_aes=False,
+                          position=position_dodge(width=0.8), size=6.5, va="bottom")
+    if len(neg):
+        p = p + geom_text(neg, aes(x="label", y="label_y", label="lab", group="season"), inherit_aes=False,
+                          position=position_dodge(width=0.8), size=6.5, va="top")
+    p = (p + facet_wrap("~panel", ncol=1, scales="free_y")
+         + scale_fill_manual(values={"first": _FIRST_GREY, "up": _UP_GREEN, "down": _DOWN_RED, "na": _NA_BLUE})
+         + labs(title=title, x="", y="",
+                subtitle=f"{key_label}: grey bar = {ya}; coloured bar = {yb} (green = went up, red = went down)")
+         + _base(max(8, 0.75 * len(order) + 3), 8)
+         + theme(legend_position="none", axis_text_x=element_text(rotation=35, ha="right", size=8),
+                 strip_text=element_text(size=9, ha="left")))
+    _save(p, outpath)
+
+
+def plot_season_change_grid(merged, metric, title, yr_a, yr_b, outpath):
+    """
+    The dashboard's line x length change grid for one bowler/team. metric="share": tile colour = change in
+    share of deliveries (pp); metric="impact": tile colour = change in Impact vs role mean / ball (cells missing
+    from either season are left blank). Each tile prints the change and, beneath it, 'first → last'.
+    """
+    t = merged.copy()
+    if metric == "share":
+        a, b, d, nd, unit, leg = "pct_a", "pct_b", "delta_pct", 1, "pp", "Δ share (pp)"
+    else:
+        a, b, d, nd, unit, leg = "impact_a", "impact_b", "delta_impact", 2, "", "Δ Impact"
+    t = t.dropna(subset=[d, "length", "line"]).copy()
+    if t.empty:
+        return
+    rows = [r for r in LENGTH_ORDER if r in set(t["length"])] + [r for r in t["length"].unique() if r not in LENGTH_ORDER]
+    cols = [c for c in LINE_ORDER if c in set(t["line"])] + [c for c in t["line"].unique() if c not in LINE_ORDER]
+    t["length"] = pd.Categorical(t["length"], categories=rows[::-1], ordered=True)
+    t["line"] = pd.Categorical(t["line"], categories=cols, ordered=True)
+    t["lab"] = [f"{dv:+.{nd}f}{unit}\n{av:.{nd}f} → {bv:.{nd}f}" for dv, av, bv in zip(t[d], t[a], t[b])]
+    vmax = max(float(t[d].abs().max()), 1e-9)
+    p = (ggplot(t, aes("line", "length", fill=d))
+         + geom_tile(color="white")
+         + geom_text(aes(x="line", y="length", label="lab"), inherit_aes=False, size=6)
+         + scale_fill_gradient2(low=_DOWN_RED, mid="white", high=_UP_GREEN, midpoint=0, limits=(-vmax, vmax))
+         + labs(title=title, x="Line", y="Length", fill=leg,
+                subtitle=f"{int(yr_a)} → {int(yr_b)}; each tile: change, then first → last season")
+         + _base(10, 6)
+         + theme(axis_text_x=element_text(rotation=35, ha="right", size=8), axis_text_y=element_text(size=8),
+                 panel_grid=element_blank()))
     _save(p, outpath)

@@ -87,6 +87,8 @@ th.sortable:hover{color:var(--accent)}
     <div class="tab" data-panel="impact">Impact Player</div>
     <div class="tab" data-panel="auction">Auction Value</div>
     <div class="tab" data-panel="movers">Biggest Movers</div>
+    <div class="tab" data-panel="compare">Compare Players</div>
+    <div class="tab" data-panel="shifts">Matchup Shifts</div>
   </div>
 </nav>
 <main>
@@ -122,9 +124,10 @@ th.sortable:hover{color:var(--accent)}
     <p class="note">Each bar = combined Impact of the player who left + the Impact Player who replaced them, for that match, compared to the <b>mean</b> other teammate in the same role (bowling or batting slot). Positive = the substitution slot outperformed a typical teammate.</p>
   </div>
   <div class="section"><h3>Impact vs mean distribution by year and innings</h3><table id="ipDistTable"></table></div>
-  <div class="section"><h3>Impact vs mean distribution by innings and year</h3>
-    <div class="chart-wrap tall"><canvas id="ipDistChart"></canvas></div>
-    <p class="note">Each distribution shows both batting and bowling slot benefit relative to the corresponding mean teammate. Comparing innings 1 with innings 2 across years shows whether the Impact Player rule's advantage shifted toward the team batting second.</p>
+  <div class="section"><h3>Impact vs mean distribution by year and innings (ridge + rain)</h3>
+    <div class="row"><select id="ipMetric"><option value="oe">Impact over expected (balls-adjusted, vs team median)</option><option value="raw">Raw impact (substitution effect vs mean teammate)</option></select></div>
+    <div id="ipRidgeWrap" style="width:100%;position:relative"><div id="ipRidgeTip" style="display:none;position:absolute;z-index:3;pointer-events:none;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:.78rem;line-height:1.35;max-width:280px;box-shadow:0 4px 12px rgba(0,0,0,.25)"></div><canvas id="ipRidge" style="display:block;width:100%"></canvas></div>
+    <p class="note"><b>Impact over expected</b> = the substituted slot's combined Impact (player in + player out) minus what that team's own median player in that role (that season) would add over the same balls faced/bowled (team-median Impact per ball × balls), batting + bowling. The team median is taken across that team's players with at least 20 balls in the role that season. <b>Raw</b> instead compares the slot's total Impact with a typical same-role teammate's total, ignoring how many balls it covered. Each ridge is a smoothed density (kernel estimate) of the Impact-Player substitution effect for one year and innings, all on the same x and density scale so heights are comparable. Every dot underneath is one substitution — <b>hover (or tap) a dot</b> to see who came in, the match, and the batting/bowling split; if a team is selected above, other teams' dots fade. Solid tick = median, dashed line = zero (no benefit vs a typical teammate). A ridge shifted right of zero means the substitution slot beat a typical same-role teammate more often than not. Shaded years/innings with fewer than 5 events are omitted.</p>
   </div>
   <div class="section"><h3>Substitution log</h3><p class="note">Click any column header to sort by it.</p><div style="max-height:420px;overflow:auto"><table id="ipTable"></table></div></div>
 </section>
@@ -155,6 +158,56 @@ th.sortable:hover{color:var(--accent)}
   <div class="section"><h3>Players ranked by change index</h3>
     <p class="note">Change index = how much a player's mix shifted between their first and last season with data (0 = no change, 100 = completely different mix; see the Change Index note on the Player Analysis tab). For bowling this is the average of two separate change indices — where they bowl (line/length grid) and how fast (pace category) — shown broken out in their own columns, since a bowler can change one without the other. "Change-index percentile" ranks the combined shift among every player with a valid change index for this metric, so you can see who changed the most relative to everyone else. "Δ percentile (benefit)" compares each player's own Impact percentile in their last season to their first, to show whether the change in approach coincided with better or worse performance. Click any column header to sort by it.</p>
     <div style="max-height:640px;overflow:auto"><table id="moversTable"></table></div>
+  </div>
+</section>
+
+<section id="compare" class="panel">
+  <div class="row">
+    <select id="cmpMode"><option value="bvb">Batter vs Bowler (batter's view)</option><option value="bvbat">Batter vs Batter</option><option value="bowl">Bowler vs Batter (bowler's view)</option><option value="bowlbowl">Bowler vs Bowler</option></select>
+    <select id="cmpOutcome">
+      <option value="runs">Strike rate (runs / 100 balls)</option>
+      <option value="impact">Impact / 100 balls</option>
+      <option value="wkt">Dismissals / 100 balls</option>
+    </select>
+  </div>
+  <div class="row">
+    <input list="cmpBatList" id="cmpA" placeholder="Batter A…" style="min-width:210px">
+    <input list="cmpBatList" id="cmpB" placeholder="Batter B…" style="min-width:210px;display:none">
+    <datalist id="cmpBatList"></datalist>
+  </div>
+  <div class="row" id="cmpBowlerRow" style="display:none">
+    <input list="cmpBowlList" id="cmpBX" placeholder="Bowler X…" style="min-width:210px">
+    <input list="cmpBowlList" id="cmpBY" placeholder="Bowler Y…" style="min-width:210px">
+    <select id="cmpCtx"><option value="batter">…facing the batter above (Batter A)</option><option value="R">…facing an average right-hander</option><option value="L">…facing an average left-hander</option></select>
+  </div>
+  <div class="section" id="cmpProfileSec"><h3>Bowler / delivery profile</h3>
+    <div class="row">
+      <select id="cmpSrc"><option value="real">A real bowler (their actual mix)</option><option value="custom">Custom profile</option></select>
+      <input list="cmpBowlList" id="cmpBowl" placeholder="Search a bowler…" style="min-width:210px">
+      <datalist id="cmpBowlList"></datalist>
+    </div>
+    <div id="cmpCustom" style="display:none">
+      <div class="row"><select id="cmpStyle"></select></div>
+      <div class="row"><label class="muted">Avg length <b id="cmpLenLbl"></b></label><input type="range" id="cmpLen" min="1" max="6" step="0.1" value="3" style="width:260px"><span class="muted">short → full toss</span></div>
+      <div class="row"><label class="muted">Avg line <b id="cmpLineLbl"></b></label><input type="range" id="cmpLine" min="1" max="4" step="0.1" value="2" style="width:260px"><span class="muted">wide outside off → down leg</span></div>
+      <div class="row"><label class="muted">Speed <b id="cmpSpdLbl"></b></label><input type="range" id="cmpSpd" min="60" max="150" step="1" value="135" style="width:260px"></div>
+    </div>
+    <div id="cmpProfileInfo" class="note"></div>
+  </div>
+  <div id="cmpOut"></div>
+</section>
+
+<section id="shifts" class="panel">
+  <div class="row">
+    <select id="shView"><option value="pair">Batter × specific bowler</option><option value="style">Batter × bowling style</option><option value="dim">Batter × length / line / speed</option><option value="bhand">Bowler × batter hand</option><option value="bmix">Bowler × where he bowls (length / line / speed mix)</option></select>
+    <select id="shPersp"><option value="bat">Batter's perspective</option><option value="bowl">Bowler's perspective</option></select>
+    <select id="shOutcome"><option value="runs">Strike rate</option><option value="impact">Impact / 100 balls</option><option value="wkt">Dismissals / 100 balls</option></select>
+    <select id="shMin"><option value="40">Min 40 balls each year</option><option value="60" selected>Min 60 balls each year</option><option value="100">Min 100 balls each year</option></select>
+    <input id="shFilter" placeholder="Filter by batter or bowler name…" style="min-width:230px">
+  </div>
+  <div class="section"><h3>Which matchups changed most, 2023 → 2024?</h3>
+    <p class="note" id="shNote"></p>
+    <div style="max-height:640px;overflow:auto"><table id="shTable"></table></div>
   </div>
 </section>
 

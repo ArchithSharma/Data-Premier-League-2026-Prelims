@@ -20,6 +20,12 @@ Implements:
   - A set of diagnostic and leaderboard plots saved as PNGs (drawn with
     plotnine; all plotting code lives in dl_pro_plots.py).
   - Year-over-year change in per-delivery bowling variation (dl_pro_variation.py).
+  - Season mix-change analysis (Section 7b): for every player and team, how the mix of deliveries
+    (batters: shot type, wagon zone; bowlers: line/length, speed) and the Impact earned from each
+    category changed between their first and last season -- change index, per-category share and
+    Impact in both seasons with the deltas and standard errors. Same definitions as the dashboard's
+    "change between seasons" views. Writes season_mix_change_categories.csv,
+    season_mix_change_summary.csv / .md and plots/season_mix_change/*.png.
   - Impact Player substitution analysis (Section 8): ingesting raw Cricsheet
     match JSON, identifying Impact Player substitution events, and measuring
     the batting/bowling Impact of the substitute for the remainder of the
@@ -89,6 +95,29 @@ from scipy.optimize import brentq, curve_fit, minimize_scalar
 # year-over-year variation test.
 from dl_pro_plots import *
 from dl_pro_variation import summarize_variation_change
+
+
+# Franchise renames: Cricsheet's 2023 files (and the `winner`/`toss` columns of the tracking CSV)
+# still say "Royal Challengers Bangalore", while the tracking data's team columns and the rest of
+# the project say "Royal Challengers Bengaluru". Left alone, the same franchise shows up as two
+# different teams -- e.g. team == team_bat comparisons silently fail for every 2023 RCB match.
+# Every team name read from a CSV or Cricsheet JSON goes through canon_team() so there is one name.
+TEAM_NAME_ALIASES = {
+    "Royal Challengers Bangalore": "Royal Challengers Bengaluru",
+}
+
+
+def canon_team(name):
+    """Map a historical/alternate franchise name to the project's canonical one (non-strings pass through)."""
+    return TEAM_NAME_ALIASES.get(name, name) if isinstance(name, str) else name
+
+
+def canon_team_columns(df, cols=("team_bat", "team_bowl", "winner", "toss", "team")):
+    """Apply canon_team to whichever of `cols` exist in df (in place) and return df."""
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].map(canon_team)
+    return df
 
 warnings.filterwarnings("ignore")
 
@@ -1692,6 +1721,313 @@ def generate_all_plots(plot_dir, fit_data, best_std, n0, lam_series,
 
 
 # --------------------------------------------------------------------------
+# 7b. Season-change analysis -- the dashboard's "change between seasons" views, reproduced as
+#     tables, a written summary and plots.
+#
+#     For every player (batters: shot type + wagon zone; bowlers: line/length + speed) and every
+#     team, compare the FIRST and LAST season that entity appears in:
+#         * share of deliveries per category (% of the entity's deliveries that year),
+#         * Impact vs the role mean per ball per category (+ standard error),
+#         * the change in both (delta share in pp, delta Impact with a combined standard error),
+#         * a single "change index" (total variation distance of the category mix: half the sum of
+#           absolute pp changes; 0 = identical mix, 100 = completely different).
+#     Same definitions as build_dashboard_data.py / template_app.js (mergeSeasons, combineSe,
+#     changeIndex), so the numbers here match what the dashboard shows.
+# --------------------------------------------------------------------------
+
+MIN_BALLS_FOR_SE = 4   # below this a category's SE is itself too noisy to report (dashboard uses the same cutoff)
+
+SEASON_CHANGE_DIMENSIONS = {
+    # key: which role/entity columns, which Impact column, how the categories are keyed
+    "shot":        dict(role="batting", player_col="bat",  team_col="team_bat",  value_col="impact",
+                        cat_cols=["shot"], label="Shot", kind="bars"),
+    "zone":        dict(role="batting", player_col="bat",  team_col="team_bat",  value_col="impact",
+                        cat_cols=["wagonzone_bp"], label="Zone", kind="bars", source="wagon"),
+    "speed":       dict(role="bowling", player_col="bowl", team_col="team_bowl", value_col="bowl_impact",
+                        cat_cols=["bowl_speed_category"], label="Speed (kph)", kind="bars"),
+    "line_length": dict(role="bowling", player_col="bowl", team_col="team_bowl", value_col="bowl_impact",
+                        cat_cols=["length", "line"], label="Line / length", kind="grid"),
+}
+
+
+def _combine_se(se_a, se_b):
+    """sqrt(se_a^2 + se_b^2) when both seasons have an SE, else whichever one exists (NaN if neither)."""
+    a = pd.to_numeric(se_a, errors="coerce").to_numpy(dtype=float)
+    b = pd.to_numeric(se_b, errors="coerce").to_numpy(dtype=float)
+    both = ~np.isnan(a) & ~np.isnan(b)
+    out = np.where(both, np.sqrt(np.where(both, a, 0) ** 2 + np.where(both, b, 0) ** 2),
+                   np.where(~np.isnan(a), a, b))
+    return pd.Series(out, index=getattr(se_a, "index", None))
+
+
+def _season_category_label(tbl, dim):
+    """Human label for each category row: 'Zone 3', '>140 kph', 'GOOD LENGTH / ON THE STUMPS', or the shot name."""
+    if dim == "zone":
+        return "Zone " + tbl["wagonzone_bp"].astype(int).astype(str)
+    if dim == "speed":
+        return tbl["bowl_speed_category"].astype(int).map(SPEED_LABELS).fillna("?")
+    if dim == "line_length":
+        return tbl["length"].astype(str).str.replace("_", " ") + " / " + tbl["line"].astype(str).str.replace("_", " ")
+    return tbl["shot"].astype(str)
+
+
+def season_category_table(d, entity_col, cat_cols, value_col, role_mean):
+    """
+    One row per (entity, year, category): balls, share of that entity-year's deliveries (pct),
+    mean Impact (impact), its standard error (se; NaN under MIN_BALLS_FOR_SE balls) and
+    impact_vs_mean = impact - role_mean. Deliveries missing any category column are dropped
+    BEFORE the shares are taken (so shares sum to 100 within each entity-year), exactly as the
+    dashboard does.
+    """
+    need = [entity_col, "year", value_col] + list(cat_cols)
+    missing = [c for c in need if c not in d.columns]
+    if missing:
+        return pd.DataFrame()
+    x = d.dropna(subset=need)
+    g = (x.groupby([entity_col, "year"] + list(cat_cols))[value_col]
+           .agg(balls="size", impact="mean", impact_std="std").reset_index())
+    g["year_balls"] = g.groupby([entity_col, "year"])["balls"].transform("sum")
+    g["pct"] = 100.0 * g["balls"] / g["year_balls"]
+    g["se"] = (g["impact_std"] / np.sqrt(g["balls"])).where(g["balls"] >= MIN_BALLS_FOR_SE)
+    g["impact_vs_mean"] = g["impact"] - role_mean
+    return g.rename(columns={entity_col: "entity"})
+
+
+def merge_season_pair(tbl, first_year=None, last_year=None):
+    """
+    Merge one entity's first-season and last-season category tables (rows of season_category_table
+    with a 'label' column) into one row per category: pct_a/pct_b/delta_pct (a category the entity
+    did not use in a season counts as 0%), impact_a/impact_b/delta_impact (NaN if the category is
+    missing from either season), se_a/se_b/delta_se, balls_a/balls_b. Returns None with <2 seasons.
+    """
+    yrs = sorted(tbl["year"].unique())
+    if len(yrs) < 2:
+        return None
+    yr_a = yrs[0] if first_year is None else first_year
+    yr_b = yrs[-1] if last_year is None else last_year
+    a = tbl[tbl["year"] == yr_a].set_index("label")
+    b = tbl[tbl["year"] == yr_b].set_index("label")
+    labels = a.index.union(b.index)
+    m = pd.DataFrame(index=labels)
+    m["pct_a"] = a["pct"].reindex(labels).fillna(0.0)
+    m["pct_b"] = b["pct"].reindex(labels).fillna(0.0)
+    m["delta_pct"] = m["pct_b"] - m["pct_a"]
+    m["impact_a"] = a["impact_vs_mean"].reindex(labels)
+    m["impact_b"] = b["impact_vs_mean"].reindex(labels)
+    m["delta_impact"] = m["impact_b"] - m["impact_a"]
+    m["se_a"] = a["se"].reindex(labels)
+    m["se_b"] = b["se"].reindex(labels)
+    m["delta_se"] = _combine_se(m["se_a"], m["se_b"]).to_numpy()
+    m["balls_a"] = a["balls"].reindex(labels).fillna(0).astype(int)
+    m["balls_b"] = b["balls"].reindex(labels).fillna(0).astype(int)
+    for extra in ("length", "line"):    # keep the grid coordinates for the line/length tile plots
+        if extra in tbl.columns:
+            m[extra] = a[extra].reindex(labels).fillna(b[extra].reindex(labels))
+    m["first_year"], m["last_year"] = int(yr_a), int(yr_b)
+    m = m.reset_index().rename(columns={"index": "label"})
+    if "label" not in m.columns:
+        m = m.rename(columns={m.columns[0]: "label"})
+    return m
+
+
+def season_change_index(merged):
+    """Total variation distance of the category mix between the two seasons (0 = same mix, 100 = disjoint)."""
+    return float(merged["delta_pct"].abs().sum() / 2.0)
+
+
+def season_change_analysis(raa_waa_df, wagon_df, role_means, qualified_batters=None, qualified_bowlers=None):
+    """
+    Build the season-change tables for every dimension in SEASON_CHANGE_DIMENSIONS, for players
+    (restricted to the qualified batters/bowlers if given -- the dashboard's player list) and for teams.
+
+    Returns (categories, summary):
+      categories -- one row per (dimension, entity, category) with every merged number above
+                    (this is the dashboard's "Show the underlying values" table, for everyone);
+      summary    -- one row per (dimension, entity): change_index, the biggest share mover, the
+                    biggest Impact swing (with its standard error) and how many categories' Impact
+                    moved by more than 2 combined standard errors.
+    """
+    cat_rows, sum_rows = [], []
+    for dim, spec in SEASON_CHANGE_DIMENSIONS.items():
+        src = wagon_df if spec.get("source") == "wagon" else raa_waa_df
+        if src is None or not len(src):
+            continue
+        role_mean = float(role_means[spec["role"]])
+        qualified = qualified_batters if spec["role"] == "batting" else qualified_bowlers
+        for etype, ecol in (("player", spec["player_col"]), ("team", spec["team_col"])):
+            tbl = season_category_table(src, ecol, spec["cat_cols"], spec["value_col"], role_mean)
+            if not len(tbl):
+                continue
+            if etype == "player" and qualified is not None:
+                tbl = tbl[tbl["entity"].isin(set(qualified))]
+            tbl["label"] = _season_category_label(tbl, dim)
+            for entity, g in tbl.groupby("entity"):
+                m = merge_season_pair(g)
+                if m is None:
+                    continue
+                m.insert(0, "entity", entity)
+                m.insert(0, "entity_type", etype)
+                m.insert(0, "dimension", dim)
+                cat_rows.append(m)
+
+                top = m.loc[m["delta_pct"].abs().idxmax()]
+                # Impact swings only count categories with enough balls in BOTH seasons to have a standard
+                # error (>= MIN_BALLS_FOR_SE each); otherwise a 1-3 ball category's Impact (e.g. one
+                # ramp shot) would always be the "biggest swing" and mean nothing.
+                both = m[m["delta_impact"].notna() & m["se_a"].notna() & m["se_b"].notna()]
+                swing = both.loc[both["delta_impact"].abs().idxmax()] if len(both) else None
+                shifted = both[both["delta_impact"].abs() > 2 * both["delta_se"]]
+                sum_rows.append({
+                    "dimension": dim, "role": spec["role"], "entity_type": etype, "entity": entity,
+                    "first_year": int(m["first_year"].iloc[0]), "last_year": int(m["last_year"].iloc[0]),
+                    "balls_first": int(m["balls_a"].sum()), "balls_last": int(m["balls_b"].sum()),
+                    "n_categories": int(len(m)),
+                    "change_index": season_change_index(m),
+                    "top_mover": top["label"], "top_mover_pct_first": top["pct_a"],
+                    "top_mover_pct_last": top["pct_b"], "top_mover_delta_pp": top["delta_pct"],
+                    "impact_swing_category": None if swing is None else swing["label"],
+                    "impact_swing_first": np.nan if swing is None else swing["impact_a"],
+                    "impact_swing_last": np.nan if swing is None else swing["impact_b"],
+                    "impact_swing_delta": np.nan if swing is None else swing["delta_impact"],
+                    "impact_swing_delta_se": np.nan if swing is None else swing["delta_se"],
+                    "n_impact_shifts_2se": int(len(shifted)),
+                })
+    categories = pd.concat(cat_rows, ignore_index=True) if cat_rows else pd.DataFrame()
+    summary = pd.DataFrame(sum_rows)
+    return categories, summary
+
+
+def _fmt_signed(v, nd=1, unit=""):
+    return "–" if v is None or pd.isna(v) else f"{v:+.{nd}f}{unit}"
+
+
+def write_season_change_summary(summary, path, top_n=10, min_balls=60):
+    """
+    Plain-language markdown summary of the season-change analysis: per dimension, the entities whose
+    category mix moved most (players and teams ranked separately; both seasons need >= min_balls
+    deliveries so tiny samples don't dominate), with each one's biggest share mover and biggest
+    Impact swing, values shown as 'first -> last' with the delta in brackets.
+    """
+    lines = ["# Season mix-change summary", "",
+             "How much each player's / team's mix of deliveries changed between their first and last "
+             "season in the data, and whether the Impact they got from each category changed with it.", "",
+             "* **Change index** -- half the sum of the absolute percentage-point changes in category share "
+             "(0 = identical mix, 100 = completely different mix).",
+             "* **Biggest share mover** -- the category whose share of deliveries moved the most "
+             "(`first% → last%`, change in pp).",
+             "* **Biggest Impact swing** -- the category whose Impact vs the role mean per ball moved the most "
+             f"(`first → last`, change ± combined standard error), among categories with at least {MIN_BALLS_FOR_SE} "
+             "deliveries in both seasons (smaller samples have no reliable standard error).",
+             "* **Shifts > 2 SE** -- number of categories whose Impact change exceeds twice its combined standard error.",
+             f"* Rankings only include entities with at least {min_balls} deliveries in each of the two seasons.", ""]
+    if summary is None or not len(summary):
+        lines.append("_No entity has two or more seasons of data, so there is nothing to compare._")
+    else:
+        dim_labels = {k: v["label"] for k, v in SEASON_CHANGE_DIMENSIONS.items()}
+        for dim, spec in SEASON_CHANGE_DIMENSIONS.items():
+            sd = summary[summary["dimension"] == dim]
+            if not len(sd):
+                continue
+            lines += [f"## {dim_labels[dim]} ({spec['role']})", ""]
+            for etype, title in (("player", "Players"), ("team", "Teams")):
+                s = sd[sd["entity_type"] == etype].copy()
+                if not len(s):
+                    continue
+                n_all = len(s)
+                s = s[(s["balls_first"] >= min_balls) & (s["balls_last"] >= min_balls)]
+                if not len(s):
+                    lines += [f"### {title}", "", f"_None of the {n_all} has {min_balls}+ deliveries in both seasons._", ""]
+                    continue
+                s = s.sort_values("change_index", ascending=False)
+                lines += [f"### {title} (median change index {s['change_index'].median():.1f} across {len(s)}; "
+                          f"top {min(top_n, len(s))} shown)", "",
+                          "| Rank | Name | Seasons | Change index | Biggest share mover | Biggest Impact swing | Shifts > 2 SE |",
+                          "|---:|---|---|---:|---|---|---:|"]
+                for i, (_, r) in enumerate(s.head(top_n).iterrows(), 1):
+                    mover = (f"{r['top_mover']}: {r['top_mover_pct_first']:.1f}% → {r['top_mover_pct_last']:.1f}% "
+                             f"({_fmt_signed(r['top_mover_delta_pp'], 1, 'pp')})")
+                    if r["impact_swing_category"] is None or pd.isna(r["impact_swing_delta"]):
+                        swing = "–"
+                    else:
+                        se_txt = "" if pd.isna(r["impact_swing_delta_se"]) else f" ± {r['impact_swing_delta_se']:.2f}"
+                        swing = (f"{r['impact_swing_category']}: {r['impact_swing_first']:.2f} → "
+                                 f"{r['impact_swing_last']:.2f} ({_fmt_signed(r['impact_swing_delta'], 2)}{se_txt})")
+                    lines.append(f"| {i} | {r['entity']} | {int(r['first_year'])}→{int(r['last_year'])} | "
+                                 f"{r['change_index']:.1f} | {mover} | {swing} | {int(r['n_impact_shifts_2se'])} |")
+                lines.append("")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
+def _slug(text):
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(text)).strip("_")
+
+
+def generate_season_change_plots(categories, summary, plot_dir, top_n=3, min_balls=60, players=None):
+    """
+    Plot the season-change views for (a) the top_n entities per dimension and entity type by change
+    index (both seasons need >= min_balls deliveries) and (b) any names listed in `players` (matched
+    against every dimension they appear in). shot / zone / speed get the two-panel share + Impact bar
+    plot (one number per bar); line_length gets a share grid and an Impact grid. Returns the paths written.
+    """
+    out_dir = os.path.join(plot_dir, "season_mix_change")
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    if categories is None or not len(categories):
+        return written
+    wanted = set()
+    elig = summary[(summary["balls_first"] >= min_balls) & (summary["balls_last"] >= min_balls)]
+    for (dim, etype), s in elig.groupby(["dimension", "entity_type"]):
+        for name in s.sort_values("change_index", ascending=False).head(top_n)["entity"]:
+            wanted.add((dim, etype, name))
+    for name in (players or []):
+        for _, r in summary[summary["entity"] == name].iterrows():
+            wanted.add((r["dimension"], r["entity_type"], name))
+    for dim, etype, name in sorted(wanted):
+        m = categories[(categories["dimension"] == dim) & (categories["entity_type"] == etype)
+                       & (categories["entity"] == name)]
+        if not len(m):
+            continue
+        spec = SEASON_CHANGE_DIMENSIONS[dim]
+        yr_a, yr_b = int(m["first_year"].iloc[0]), int(m["last_year"].iloc[0])
+        idx = season_change_index(m)
+        stem = os.path.join(out_dir, f"{dim}__{etype}__{_slug(name)}")
+        title = f"{name} — {spec['label']} mix, {yr_a} → {yr_b}  (change index {idx:.1f})"
+        if spec["kind"] == "bars":
+            plot_season_change_pair(m, title, spec["label"], yr_a, yr_b, stem + ".png")
+            written.append(stem + ".png")
+        else:
+            plot_season_change_grid(m, "share", title + " — share of deliveries", yr_a, yr_b, stem + "_share.png")
+            plot_season_change_grid(m, "impact", title + " — Impact vs role mean / ball", yr_a, yr_b, stem + "_impact.png")
+            written += [stem + "_share.png", stem + "_impact.png"]
+    return written
+
+
+def run_season_change_outputs(raa_waa_df, wagon_df, role_means, outdir, plot_dir,
+                              qualified_batters=None, qualified_bowlers=None,
+                              top_n=10, plot_top_n=3, min_balls=60, players=None):
+    """Compute, save (CSV + markdown) and plot the season-change analysis. Returns (categories, summary)."""
+    categories, summary = season_change_analysis(raa_waa_df, wagon_df, role_means,
+                                                 qualified_batters, qualified_bowlers)
+    categories.to_csv(os.path.join(outdir, "season_mix_change_categories.csv"), index=False)
+    summary.to_csv(os.path.join(outdir, "season_mix_change_summary.csv"), index=False)
+    write_season_change_summary(summary, os.path.join(outdir, "season_mix_change_summary.md"),
+                                top_n=top_n, min_balls=min_balls)
+    paths = generate_season_change_plots(categories, summary, plot_dir, top_n=plot_top_n,
+                                         min_balls=min_balls, players=players)
+    print(f"\n=== Season-change analysis ===\n{len(summary)} entity x dimension comparisons "
+          f"({summary['entity'].nunique() if len(summary) else 0} players/teams); "
+          f"{len(paths)} plots in {os.path.join(plot_dir, 'season_mix_change')}/")
+    if len(summary):
+        top = (summary[(summary['balls_first'] >= min_balls) & (summary['balls_last'] >= min_balls)]
+               .sort_values('change_index', ascending=False).head(5))
+        print(top[["dimension", "entity_type", "entity", "first_year", "last_year", "change_index",
+                   "top_mover", "top_mover_delta_pp"]].round(2).to_string(index=False))
+    return categories, summary
+
+
+# --------------------------------------------------------------------------
 # 7. Main (original CSV-driven pipeline: physical attributes, season, venue,
 #    auction, wagon-wheel, shot/zone analyses -- everything from the earlier
 #    version of this script. Requires a ball-tracking CSV with line/length/
@@ -1704,12 +2040,14 @@ def main(csv_path, outdir="dl_pro_out", fix_n0=1.04, impact_clip=20.0,
          min_matches_venue=4, top_n_plot=20,
          auction_xlsx_path=None, money_unit="crore", min_balls_auction=100, name_match_cutoff=0.82,
          min_count_variation=20, variation_include_speed=False,
-         impact_player_json_dir=None, impact_player_year_min=None, impact_player_year_max=None):
+         impact_player_json_dir=None, impact_player_year_min=None, impact_player_year_max=None,
+         season_change_top_n=10, season_change_plot_top_n=3, season_change_min_balls=60,
+         season_change_players=None):
     os.makedirs(outdir, exist_ok=True)
     plot_dir = os.path.join(outdir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
 
-    df = pd.read_csv(csv_path, low_memory=False)
+    df = canon_team_columns(pd.read_csv(csv_path, low_memory=False))
 
     # ---- Drop rain/DLS-affected matches up front ----
     clean_matches = get_clean_matches(df)
@@ -1969,6 +2307,14 @@ def main(csv_path, outdir="dl_pro_out", fix_n0=1.04, impact_clip=20.0,
                         min_count_variation=min_count_variation, variation_table_speed=variation_table_speed,
                         wagon_df=wagon_df, wagon_zone_table=wagon_zone_table)
 
+    # ---- Season-change analysis (first vs last season mix + Impact, players and teams): tables,
+    #      markdown summary and plots -- the dashboard's "change between seasons" views. ----
+    run_season_change_outputs(
+        raa_waa_df, wagon_df, role_means, outdir, plot_dir,
+        qualified_batters=bat_summary.index, qualified_bowlers=bowl_summary.index,
+        top_n=season_change_top_n, plot_top_n=season_change_plot_top_n,
+        min_balls=season_change_min_balls, players=season_change_players)
+
     # ---- Impact Player substitutions vs. the team's median same-role
     #      alternative, using THIS dataset's own Impact numbers. Substitution
     #      events themselves come from raw Cricsheet JSON (Data_Premier_League
@@ -2079,14 +2425,14 @@ def load_cricsheet_matches(json_dir):
         year = season_to_year(info.get("season"))
         full_overs = info.get("overs", 20)
         ground = info.get("venue")
-        teams = info.get("teams", [])
+        teams = [canon_team(t) for t in info.get("teams", [])]
 
         innings_list = d["innings"][:2]
         if len(innings_list) < 2:
             continue
 
         for inns_idx, inn in enumerate(innings_list, start=1):
-            team_bat = inn["team"]
+            team_bat = canon_team(inn["team"])
             team_bowl_list = [t for t in teams if t != team_bat]
             team_bowl = team_bowl_list[0] if team_bowl_list else None
 
@@ -2133,7 +2479,7 @@ def load_cricsheet_matches(json_dir):
                             if r.get("reason") == "impact_player":
                                 subs.append({
                                     "p_match": match_id, "year": year, "inns_entered": inns_idx,
-                                    "over_num": over_num, "team": r.get("team"),
+                                    "over_num": over_num, "team": canon_team(r.get("team")),
                                     "player_in": r.get("in"), "player_out": r.get("out"),
                                 })
 
@@ -2176,7 +2522,7 @@ def extract_impact_subs_from_json(json_dir, match_ids=None):
                             if r.get("reason") == "impact_player":
                                 subs.append({
                                     "p_match": match_id, "year": year, "inns_entered": inns_idx,
-                                    "over_num": over_num, "team": r.get("team"),
+                                    "over_num": over_num, "team": canon_team(r.get("team")),
                                     "player_in": r.get("in"), "player_out": r.get("out"),
                                 })
     return pd.DataFrame(subs).drop_duplicates(subset=["p_match", "player_in", "team"])
@@ -2530,6 +2876,13 @@ CSV_CONFIG = {
     "impact_player_json_dir": "ipl_json",  # raw Cricsheet JSON covering the CSV's matches; None to skip
     "impact_player_year_min": 2023,
     "impact_player_year_max": 2024,
+    # Season-change analysis (first vs last season mix + Impact): ranking size in the markdown summary,
+    # how many top movers per dimension get plots, the minimum deliveries in each of the two seasons
+    # for an entity to be ranked/plotted, and any extra names to always plot (e.g. ["V Kohli"]).
+    "season_change_top_n": 10,
+    "season_change_plot_top_n": 3,
+    "season_change_min_balls": 60,
+    "season_change_players": None,
 }
 
 IMPACT_PLAYER_CONFIG = {

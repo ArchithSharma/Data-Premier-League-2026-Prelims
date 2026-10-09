@@ -1,7 +1,18 @@
 import pandas as pd, numpy as np, json, os
 
 OUT = "dl_pro_out"
-d = pd.read_csv(f"{OUT}/ball_by_ball_raa_waa_impact.csv", low_memory=False)
+# Franchise renames: Cricsheet / the tracking CSV's `winner` and `toss` columns say "Royal Challengers
+# Bangalore" for 2023, everything else says "Bengaluru". Same mapping as dl_pro_fit.canon_team (kept
+# local so this script doesn't have to import the whole pipeline); apply it to every team-name column
+# of every CSV we read so one franchise can never show up as two teams.
+TEAM_NAME_ALIASES = {"Royal Challengers Bangalore": "Royal Challengers Bengaluru"}
+def canon_teams(df, cols=("team_bat", "team_bowl", "winner", "toss", "team", "auction_team")):
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].replace(TEAM_NAME_ALIASES)
+    return df
+
+d = canon_teams(pd.read_csv(f"{OUT}/ball_by_ball_raa_waa_impact.csv", low_memory=False))
 bat_sum = pd.read_csv(f"{OUT}/batter_summary.csv")
 bowl_sum = pd.read_csv(f"{OUT}/bowler_summary.csv")
 venue = pd.read_csv(f"{OUT}/venue_summary.csv")
@@ -13,7 +24,7 @@ team_line_saved = pd.read_csv(f"{OUT}/team_line_length_by_year.csv") if os.path.
 team_speed_saved = pd.read_csv(f"{OUT}/team_speed_by_year.csv") if os.path.exists(f"{OUT}/team_speed_by_year.csv") else pd.DataFrame()
 season_bat_sum = pd.read_csv(f"{OUT}/season_batter_summary.csv") if os.path.exists(f"{OUT}/season_batter_summary.csv") else pd.DataFrame()
 season_bowl_sum = pd.read_csv(f"{OUT}/season_bowler_summary.csv") if os.path.exists(f"{OUT}/season_bowler_summary.csv") else pd.DataFrame()
-imp_perf = pd.read_csv(f"{OUT}/impact_player_performance.csv")
+imp_perf = canon_teams(pd.read_csv(f"{OUT}/impact_player_performance.csv"))
 auction = pd.read_csv(f"{OUT}/impact_per_rupee.csv")
 auction = auction[auction["total_balls"] >= 100].copy()
 
@@ -463,6 +474,27 @@ print(f"teams: {len(teams)}")
 # ---------------------------------------------------------------
 # IMPACT PLAYER EVENTS
 # ---------------------------------------------------------------
+# Team-specific baselines for "Impact over expected": the median, across that team's own players
+# in that season, of Impact per ball (batting for the batting side, bowling for the bowling
+# side). Players need MIN_BASELINE_BALLS in that role so tiny samples don't set the median.
+MIN_BASELINE_BALLS = 20
+def team_median_pb(team_col, player_col, impact_col):
+    g = d.groupby([team_col, "year", player_col])[impact_col].agg(["sum", "size"]).reset_index()
+    g = g[g["size"] >= MIN_BASELINE_BALLS]
+    g["pb"] = g["sum"] / g["size"]
+    return g.groupby([team_col, "year"])["pb"].median().to_dict()
+TEAM_MED_BAT = team_median_pb("team_bat", "bat", "impact")
+TEAM_MED_BOWL = team_median_pb("team_bowl", "bowl", "bowl_impact")
+print("team median impact/ball (bat):", {k: round(v, 3) for k, v in sorted(TEAM_MED_BAT.items())[:4]}, "...")
+
+# Team names were normalised on load (canon_teams above). Cricsheet's 2023 files said "Royal Challengers
+# Bangalore", which made every 2023 RCB event come out as "Batted 2nd" (name mismatch) and made the
+# team-median baseline lookup miss them. Batted 1st/2nd is re-derived directly from the tracking data
+# so the shipped numbers are right even if impact_player_performance.csv predates the pipeline fix.
+_first_bat = d[d["inns"] == 1].drop_duplicates("p_match").set_index("p_match")["team_bat"]
+imp_perf["team_role"] = [("Batted 1st" if _first_bat.get(m) == t else "Batted 2nd") if m in _first_bat.index else "Unknown"
+                         for m, t in zip(imp_perf["p_match"], imp_perf["team"])]
+
 ip_events = []
 for _, r in imp_perf.iterrows():
     m = match_meta.loc[r["p_match"]]
@@ -475,6 +507,15 @@ for _, r in imp_perf.iterrows():
         "batting_vs_mean": R(r["batting_slot_impact_vs_mean"]),
         "bowling_vs_mean": R(r["bowling_slot_impact_vs_mean"]),
         "substitution_effect": R(r["substitution_effect"]),
+        # Impact over expected: combined in+out Impact minus that team's (own-season) median
+        # Impact/ball in the role, times the balls actually faced/bowled.
+        "bat_balls": int(r["combined_bat_balls"]), "bowl_balls": int(r["combined_bowl_balls"]),
+        "bat_exp_pb": R(TEAM_MED_BAT.get((r["team"], r["year"]), ROLE_MEANS["batting"])),
+        "bowl_exp_pb": R(TEAM_MED_BOWL.get((r["team"], r["year"]), ROLE_MEANS["bowling"])),
+        "bat_oe": R(r["combined_batting_impact"] - TEAM_MED_BAT.get((r["team"], r["year"]), ROLE_MEANS["batting"]) * r["combined_bat_balls"]),
+        "bowl_oe": R(r["combined_bowling_impact"] - TEAM_MED_BOWL.get((r["team"], r["year"]), ROLE_MEANS["bowling"]) * r["combined_bowl_balls"]),
+        "oe": R(r["combined_batting_impact"] - TEAM_MED_BAT.get((r["team"], r["year"]), ROLE_MEANS["batting"]) * r["combined_bat_balls"]
+                + r["combined_bowling_impact"] - TEAM_MED_BOWL.get((r["team"], r["year"]), ROLE_MEANS["bowling"]) * r["combined_bowl_balls"]),
     })
 ip_events.sort(key=lambda x: x["date"])
 print(f"impact player events: {len(ip_events)}")
@@ -496,8 +537,11 @@ for _, r in auction.iterrows():
     })
 print(f"auction rows: {len(auc)}")
 
+from build_matchup_data import build_matchups
+MATCHUPS = build_matchups(d)
+
 DATA = {
-    "players": players, "teams": teams, "impact_player": ip_events, "auction": auc,
+    "matchups": MATCHUPS, "players": players, "teams": teams, "impact_player": ip_events, "auction": auc,
     "team_names": list(TEAM_LOGO_FILE.keys()), "league_variation": league_var_map,
     "league_variation_overall": league_variation_overall,
     "role_means": ROLE_MEANS,
